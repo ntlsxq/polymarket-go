@@ -378,14 +378,13 @@ func computeOrderAmounts(side string, size, price float64, rc RoundConfig) (side
 	return sideInt, makerAmount, takerAmount
 }
 
-func (c *Client) PostOrder(ctx context.Context, signedOrder any, orderType string) (map[string]any, error) {
-	so, ok := signedOrder.(*SignedOrder)
-	if !ok {
-		return nil, fmt.Errorf("signedOrder must be *SignedOrder")
+func (c *Client) PostOrder(ctx context.Context, signedOrder *SignedOrder, orderType string) (*PostOrderResponse, error) {
+	if signedOrder == nil {
+		return nil, fmt.Errorf("PostOrder: signedOrder is nil")
 	}
 
 	body := map[string]any{
-		"order":     so.Dict(),
+		"order":     signedOrder.Dict(),
 		"owner":     c.creds.ApiKey,
 		"orderType": orderType,
 		"postOnly":  false,
@@ -397,14 +396,14 @@ func (c *Client) PostOrder(ctx context.Context, signedOrder any, orderType strin
 		return nil, err
 	}
 
-	var result map[string]any
+	var result PostOrderResponse
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("parse post_order response: %w", err)
 	}
-	return result, nil
+	return &result, nil
 }
 
-func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]map[string]any, error) {
+func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]PostOrderResponse, error) {
 	if len(orders) > 15 {
 		return nil, fmt.Errorf("PostOrders: max 15 orders per batch, got %d", len(orders))
 	}
@@ -432,7 +431,7 @@ func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]map[s
 		return nil, err
 	}
 
-	var result []map[string]any
+	var result []PostOrderResponse
 	if err := json.Unmarshal(raw, &result); err != nil {
 		span.SetAttributes(attribute.Bool("error", true), attribute.String("err", "parse"))
 		return nil, fmt.Errorf("parse post_orders response: %w", err)

@@ -76,17 +76,9 @@ type OrderEvent struct {
 	Timestamp       string         `json:"timestamp"`
 }
 
-type MakerOrder struct {
-	OrderID       string `json:"order_id"`
-	Owner         string `json:"owner"`
-	MakerAddress  string `json:"maker_address"`
-	MatchedAmount string `json:"matched_amount"`
-	Price         string `json:"price"`
-	FeeRateBps    string `json:"fee_rate_bps"`
-	AssetID       string `json:"asset_id"`
-	Outcome       string `json:"outcome"`
-	Side          string `json:"side"`
-}
+// MakerOrder is the counterparty-maker entry inside a Fill/Trade.
+// Re-exported from clob so consumers of polymarket don't need both imports.
+type MakerOrder = clob.MakerOrder
 
 type Fill struct {
 	ID              string       `json:"id"`

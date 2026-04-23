@@ -15,16 +15,6 @@ const dataAPIBase = "https://data-api.polymarket.com"
 
 var dataAPIClient = &http.Client{Timeout: 30 * time.Second}
 
-type Position struct {
-	Asset       string  `json:"asset"`
-	ConditionID string  `json:"conditionId"`
-	Size        float64 `json:"size"`
-	AvgPrice    float64 `json:"avgPrice"`
-	CurPrice    float64 `json:"curPrice"`
-	Redeemable  bool    `json:"redeemable"`
-	Mergeable   bool    `json:"mergeable"`
-}
-
 func (c *Client) GetInventory(ctx context.Context) ([]Position, error) {
 	const pageSize = 500
 	var all []Position

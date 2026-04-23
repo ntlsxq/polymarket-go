@@ -89,40 +89,39 @@ func (c *Client) PrefetchTickSizes(ctx context.Context, tokenIDs []string, store
 	return nil
 }
 
-func (c *Client) GetBalanceAllowance(ctx context.Context) (map[string]any, error) {
+func (c *Client) GetBalanceAllowance(ctx context.Context) (*BalanceAllowance, error) {
 	path := EndpointGetBalanceAllowance + "?asset_type=COLLATERAL&signature_type=" + fmt.Sprintf("%d", c.sigType)
 	raw, err := c.doGet(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 
-	var result map[string]any
+	var result BalanceAllowance
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("parse balance_allowance response: %w", err)
 	}
-	return result, nil
+	return &result, nil
 }
 
 func (c *Client) GetBalance(ctx context.Context) (float64, error) {
-	result, err := c.GetBalanceAllowance(ctx)
+	ba, err := c.GetBalanceAllowance(ctx)
 	if err != nil {
 		return 0, err
 	}
-
-	switch v := result["balance"].(type) {
-	case float64:
-		return v, nil
-	case string:
-		var f float64
-		_, _ = fmt.Sscanf(v, "%f", &f)
-		return f, nil
-	default:
-		return 0, fmt.Errorf("unexpected balance type: %T", v)
+	if ba.Balance == "" {
+		return 0, nil
 	}
+	var f float64
+	if _, err := fmt.Sscanf(ba.Balance, "%f", &f); err != nil {
+		return 0, fmt.Errorf("parse balance %q: %w", ba.Balance, err)
+	}
+	return f, nil
 }
 
-func (c *Client) GetOrders(ctx context.Context) ([]map[string]any, error) {
-	var allOrders []map[string]any
+// GetOrders fetches all open orders for the authenticated user, paging through
+// next_cursor until LTE= (sentinel for last page).
+func (c *Client) GetOrders(ctx context.Context) ([]Order, error) {
+	var all []Order
 	cursor := "MA=="
 
 	for {
@@ -131,62 +130,78 @@ func (c *Client) GetOrders(ctx context.Context) ([]map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		log.Debug().RawJSON("raw", raw).Msg("[CLOB] get_orders_response")
 
-		var page []map[string]any
-		if err := json.Unmarshal(raw, &page); err != nil {
-			var wrapped struct {
-				Data       []map[string]any `json:"data"`
-				NextCursor string           `json:"next_cursor"`
-			}
-			if err2 := json.Unmarshal(raw, &wrapped); err2 != nil {
-				return nil, fmt.Errorf("parse orders response: %w", err)
-			}
-			allOrders = append(allOrders, wrapped.Data...)
-			if wrapped.NextCursor == "" || wrapped.NextCursor == "LTE=" {
-				break
-			}
-			cursor = wrapped.NextCursor
-			continue
+		// Two wire shapes exist: bare array (legacy) and {data, next_cursor, ...}.
+		var page []Order
+		if err := json.Unmarshal(raw, &page); err == nil {
+			all = append(all, page...)
+			break
 		}
-
-		allOrders = append(allOrders, page...)
-		break
+		var wrapped struct {
+			Data       []Order `json:"data"`
+			NextCursor string  `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(raw, &wrapped); err != nil {
+			return nil, fmt.Errorf("parse orders response: %w", err)
+		}
+		all = append(all, wrapped.Data...)
+		if wrapped.NextCursor == "" || wrapped.NextCursor == "LTE=" {
+			break
+		}
+		cursor = wrapped.NextCursor
 	}
 
-	return allOrders, nil
+	return all, nil
 }
 
-func (c *Client) PostHeartbeat(ctx context.Context, heartbeatID string) (map[string]any, error) {
-	var body map[string]any
+// GetOrder fetches a single open order by its ID via GET /data/order/{id}.
+func (c *Client) GetOrder(ctx context.Context, orderID string) (*Order, error) {
+	if orderID == "" {
+		return nil, fmt.Errorf("GetOrder: orderID is empty")
+	}
+	raw, err := c.doGet(ctx, EndpointGetOrder+orderID)
+	if err != nil {
+		return nil, err
+	}
+	var o Order
+	if err := json.Unmarshal(raw, &o); err != nil {
+		return nil, fmt.Errorf("parse order response: %w", err)
+	}
+	return &o, nil
+}
+
+type HeartbeatResponse struct {
+	HeartbeatID string `json:"heartbeat_id"`
+}
+
+func (c *Client) PostHeartbeat(ctx context.Context, heartbeatID string) (*HeartbeatResponse, error) {
+	body := map[string]any{"heartbeat_id": nil}
 	if heartbeatID != "" {
-		body = map[string]any{"heartbeat_id": heartbeatID}
-	} else {
-		body = map[string]any{"heartbeat_id": nil}
+		body["heartbeat_id"] = heartbeatID
 	}
 
 	raw, err := c.doPost(ctx, EndpointPostHeartbeat, body)
 	if err != nil {
+		// Server returns the allocated heartbeat_id inside a 4xx body on the
+		// very first call — recover it from the error string.
 		errStr := err.Error()
 		if idx := strings.Index(errStr, "{"); idx >= 0 {
 			jsonPart := errStr[idx:]
 			if end := strings.LastIndex(jsonPart, "}"); end >= 0 {
 				jsonPart = jsonPart[:end+1]
 			}
-			var errResp map[string]any
-			if json.Unmarshal([]byte(jsonPart), &errResp) == nil {
-				if hbID, ok := errResp["heartbeat_id"].(string); ok && hbID != "" {
-					return errResp, nil
-				}
+			var hb HeartbeatResponse
+			if json.Unmarshal([]byte(jsonPart), &hb) == nil && hb.HeartbeatID != "" {
+				return &hb, nil
 			}
 		}
 		return nil, err
 	}
 
-	var result map[string]any
-	if err := json.Unmarshal(raw, &result); err != nil {
+	var hb HeartbeatResponse
+	if err := json.Unmarshal(raw, &hb); err != nil {
 		return nil, fmt.Errorf("parse heartbeat response: %w", err)
 	}
-	return result, nil
+	return &hb, nil
 }
