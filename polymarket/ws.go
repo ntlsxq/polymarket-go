@@ -11,7 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 
-	"github.com/user/polymarket-go/book"
+	"github.com/ntlsxq/polymarket-go/book"
 )
 
 const wsMarketURL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

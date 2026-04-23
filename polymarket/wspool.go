@@ -7,7 +7,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/user/polymarket-go/book"
+	"github.com/ntlsxq/polymarket-go/book"
 )
 
 type WSPool struct {

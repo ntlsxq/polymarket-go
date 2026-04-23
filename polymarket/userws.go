@@ -8,7 +8,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 
-	"github.com/user/polymarket-go/clob"
+	"github.com/ntlsxq/polymarket-go/clob"
 )
 
 type WSEventLogger interface {

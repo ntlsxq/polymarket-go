@@ -1,4 +1,4 @@
-module github.com/user/polymarket-go
+module github.com/ntlsxq/polymarket-go
 
 go 1.26
 
