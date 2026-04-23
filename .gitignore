@@ -1,0 +1,6 @@
+go.work
+go.work.sum
+.idea/
+.vscode/
+*.test
+*.out
