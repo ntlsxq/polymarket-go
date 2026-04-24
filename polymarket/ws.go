@@ -23,6 +23,7 @@ type MarketWS struct {
 	onTickSizeChange func(tokenID, newTickSize string)
 	onConnect        func()
 	onDisconnect     func()
+	filter           func(raw []byte) bool
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -45,6 +46,16 @@ func WithEventLog(el WSEventLogger) WSOption {
 }
 
 func (ws *MarketWS) SetEventLog(el WSEventLogger) { ws.events = el }
+
+// SetFilter installs a pre-dispatch hook: Run calls filter(raw) and drops the
+// frame on false. Used to plug a Deduper when this WS is one of N redundant
+// streams sharing a source.
+func (ws *MarketWS) SetFilter(fn func(raw []byte) bool) { ws.filter = fn }
+
+// SetOnConnect / SetOnDisconnect let a Pool aggregate per-member connection
+// state without going through the construction-time WSOption path.
+func (ws *MarketWS) SetOnConnect(fn func())    { ws.onConnect = fn }
+func (ws *MarketWS) SetOnDisconnect(fn func()) { ws.onDisconnect = fn }
 
 func NewMarketWS(books *book.Manager, opts ...WSOption) *MarketWS {
 	ws := &MarketWS{
@@ -143,6 +154,9 @@ func (ws *MarketWS) Run(ctx context.Context) {
 }
 
 func (ws *MarketWS) dispatch(raw []byte) {
+	if ws.filter != nil && !ws.filter(raw) {
+		return
+	}
 	recvTs := time.Now()
 	var items []json.RawMessage
 	if json.Unmarshal(raw, &items) != nil {

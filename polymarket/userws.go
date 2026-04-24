@@ -104,6 +104,9 @@ type UserWS struct {
 	onFill       func(Fill)
 	onOrder      func(OrderEvent)
 	onReconnect  func()
+	onConnect    func()
+	onDisconnect func()
+	filter       func(raw []byte) bool
 
 	connected bool
 }
@@ -128,6 +131,15 @@ func (u *UserWS) SetEventLog(el WSEventLogger) {
 	u.events = el
 }
 
+// SetFilter installs a pre-dispatch hook — dispatchRaw drops frames where
+// filter returns false. Pair with a shared Deduper to run N UserWS instances
+// for redundancy without duplicating order/fill side effects.
+func (u *UserWS) SetFilter(fn func(raw []byte) bool) { u.filter = fn }
+
+// SetOnConnect / SetOnDisconnect let a Pool aggregate connection state.
+func (u *UserWS) SetOnConnect(fn func())    { u.onConnect = fn }
+func (u *UserWS) SetOnDisconnect(fn func()) { u.onDisconnect = fn }
+
 func (u *UserWS) Connected() bool { return u.connected }
 
 func (u *UserWS) Run(ctx context.Context) {
@@ -151,13 +163,26 @@ func (u *UserWS) Run(ctx context.Context) {
 			log.Info().Int("markets", len(u.conditionIDs)).Msg("[USER_WS] connected")
 			return nil
 		},
-		onMessage:   u.dispatchRaw,
-		onDown:      func() { u.connected = false },
+		onMessage: u.dispatchRaw,
+		onUp: func() {
+			if u.onConnect != nil {
+				u.onConnect()
+			}
+		},
+		onDown: func() {
+			u.connected = false
+			if u.onDisconnect != nil {
+				u.onDisconnect()
+			}
+		},
 		onReconnect: u.onReconnect,
 	})
 }
 
 func (u *UserWS) dispatchRaw(raw []byte) {
+	if u.filter != nil && !u.filter(raw) {
+		return
+	}
 	recvTs := time.Now()
 	var envelope struct {
 		EventType string `json:"event_type"`
