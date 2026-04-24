@@ -119,9 +119,14 @@ func NewUserWS(creds *clob.ApiCreds, conditionIDs []string, onFill func(Fill)) *
 	}
 }
 
-func (u *UserWS) SetOnOrder(fn func(OrderEvent)) {
-	u.onOrder = fn
-}
+// SetOnOrder installs the handler for PLACEMENT/CANCELLATION/UPDATE events.
+// Can be called post-construction so a Pool can fan out one handler to all
+// members.
+func (u *UserWS) SetOnOrder(fn func(OrderEvent)) { u.onOrder = fn }
+
+// SetOnFill replaces the fill handler set at construction. Mainly for Pool
+// fan-out after the fact.
+func (u *UserWS) SetOnFill(fn func(Fill)) { u.onFill = fn }
 
 func (u *UserWS) SetOnReconnect(fn func()) {
 	u.onReconnect = fn

@@ -154,3 +154,61 @@ func (p *Pool[T]) handleDisconnect() {
 		p.onAllDown()
 	}
 }
+
+// UserPool is Pool[*UserWS] + domain fan-outs: setting an order/fill
+// handler on the pool installs it on every member. Run/Connected/Stats
+// etc. come through the embedded *Pool.
+type UserPool struct {
+	*Pool[*UserWS]
+}
+
+// NewUserPool wraps the generic Pool with UserWS-specific fan-outs.
+func NewUserPool(members []*UserWS, opts ...PoolOption[*UserWS]) *UserPool {
+	return &UserPool{Pool: NewPool[*UserWS](members, opts...)}
+}
+
+// SetOnOrder installs fn on every member.
+func (p *UserPool) SetOnOrder(fn func(OrderEvent)) {
+	for _, ws := range p.Members() {
+		ws.SetOnOrder(fn)
+	}
+}
+
+// SetOnFill installs fn on every member.
+func (p *UserPool) SetOnFill(fn func(Fill)) {
+	for _, ws := range p.Members() {
+		ws.SetOnFill(fn)
+	}
+}
+
+// SetOnReconnect installs fn on every member.
+func (p *UserPool) SetOnReconnect(fn func()) {
+	for _, ws := range p.Members() {
+		ws.SetOnReconnect(fn)
+	}
+}
+
+// MarketPool is Pool[*MarketWS] + MarketWS-specific fan-outs (subscribe /
+// unsubscribe tokens across all members).
+type MarketPool struct {
+	*Pool[*MarketWS]
+}
+
+// NewMarketPool wraps the generic Pool with MarketWS-specific fan-outs.
+func NewMarketPool(members []*MarketWS, opts ...PoolOption[*MarketWS]) *MarketPool {
+	return &MarketPool{Pool: NewPool[*MarketWS](members, opts...)}
+}
+
+// SubscribeTokens fans out the subscription to every member.
+func (p *MarketPool) SubscribeTokens(tokenIDs []string) {
+	for _, ws := range p.Members() {
+		ws.SubscribeTokens(tokenIDs)
+	}
+}
+
+// UnsubscribeTokens fans out the unsubscription to every member.
+func (p *MarketPool) UnsubscribeTokens(tokenIDs []string) {
+	for _, ws := range p.Members() {
+		ws.UnsubscribeTokens(tokenIDs)
+	}
+}
