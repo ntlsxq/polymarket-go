@@ -2,15 +2,15 @@ package polymarket
 
 import (
 	"context"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 
 	"github.com/rs/zerolog/log"
 )
 
-// WSMember is the interface both MarketWS and UserWS satisfy — the minimal
-// surface a Pool needs for run/lifecycle and connection tracking. SetFilter
-// is how a shared Deduper is plugged in for redundancy dedup.
+// WSMember is the minimal contract a Pool entry satisfies. MarketWS and
+// UserWS both implement it.
 type WSMember interface {
 	Run(ctx context.Context)
 	Connected() bool
@@ -20,16 +20,25 @@ type WSMember interface {
 	SetOnDisconnect(fn func())
 }
 
-// Pool runs N parallel WS instances of the same type for redundancy,
-// deduplicating incoming frames by content hash (first-to-arrive wins).
-// Aggregates connection count so Connected() reports any-up. Optional
-// onAllDown fires when the last member drops — domain-specific recovery
-// (e.g. MarketWS pool clears book atomics so stale prices don't drive
-// decisions).
+// Pool is a thin wrapper around N parallel WS members of the same type.
+// Identical frames arriving from any two members collapse to one delivery:
+// the first frame with a given content hash flows through, later siblings
+// drop before dispatch. No TTL, no timers — a bounded hash set resets when
+// it fills, which at realistic rates preserves seconds of history.
+//
+// Optional onAllDown fires when the last member disconnects (domain hook,
+// e.g. clear stale book atomics).
 type Pool[T WSMember] struct {
-	members   []T
-	dedup     *Deduper
+	members []T
+
+	mu       sync.Mutex
+	seen     map[uint64]struct{}
+	capacity int
+
 	connCount atomic.Int32
+	accepted  atomic.Int64
+	dropped   atomic.Int64
+
 	onAllDown func()
 	onFirstUp func()
 }
@@ -46,23 +55,36 @@ func WithOnFirstUp[T WSMember](fn func()) PoolOption[T] {
 	return func(p *Pool[T]) { p.onFirstUp = fn }
 }
 
-// NewPool wires members to a shared Deduper and connection-count tracker.
-// Members must outlive the pool (pool doesn't own them). Pass opts to attach
-// domain-specific recovery hooks.
-func NewPool[T WSMember](dedup *Deduper, members []T, opts ...PoolOption[T]) *Pool[T] {
-	p := &Pool[T]{members: members, dedup: dedup}
+// WithCapacity sets the dedup set's max size (default 4096). The set resets
+// when full, so capacity bounds both memory and max history window.
+func WithCapacity[T WSMember](n int) PoolOption[T] {
+	return func(p *Pool[T]) {
+		if n > 0 {
+			p.capacity = n
+		}
+	}
+}
+
+// NewPool wires dedup and connection-tracking into each member and returns
+// the pool. Members must outlive the pool.
+func NewPool[T WSMember](members []T, opts ...PoolOption[T]) *Pool[T] {
+	p := &Pool[T]{
+		members:  members,
+		capacity: 4096,
+	}
 	for _, o := range opts {
 		o(p)
 	}
+	p.seen = make(map[uint64]struct{}, p.capacity)
 	for _, m := range members {
-		m.SetFilter(dedup.Accept)
+		m.SetFilter(p.accept)
 		m.SetOnConnect(p.handleConnect)
 		m.SetOnDisconnect(p.handleDisconnect)
 	}
 	return p
 }
 
-// Run blocks until ctx is done, spawning one goroutine per member.
+// Run spawns one goroutine per member and blocks until ctx is done.
 func (p *Pool[T]) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i, m := range p.members {
@@ -79,8 +101,8 @@ func (p *Pool[T]) Run(ctx context.Context) {
 // Connected reports whether at least one member currently has a live socket.
 func (p *Pool[T]) Connected() bool { return p.connCount.Load() > 0 }
 
-// Members returns the slice of members for domain-specific fan-out (e.g.
-// MarketWS.SubscribeTokens on each).
+// Members exposes the underlying slice for domain-specific fan-out
+// (e.g. MarketWS.SubscribeTokens on each).
 func (p *Pool[T]) Members() []T { return p.members }
 
 // SetEventLog fans out the event sink to every member.
@@ -90,8 +112,32 @@ func (p *Pool[T]) SetEventLog(el WSEventLogger) {
 	}
 }
 
-// Dedup exposes the deduper for stats/observability.
-func (p *Pool[T]) Dedup() *Deduper { return p.dedup }
+// Stats returns cumulative (accepted, dropped) frames. In a 2-member pool
+// both healthy, dropped ≈ accepted.
+func (p *Pool[T]) Stats() (accepted, dropped int64) {
+	return p.accepted.Load(), p.dropped.Load()
+}
+
+// accept is the filter plugged into each member. First frame with a given
+// content hash wins; siblings drop.
+func (p *Pool[T]) accept(raw []byte) bool {
+	h := fnv.New64a()
+	_, _ = h.Write(raw)
+	k := h.Sum64()
+	p.mu.Lock()
+	if _, ok := p.seen[k]; ok {
+		p.mu.Unlock()
+		p.dropped.Add(1)
+		return false
+	}
+	if len(p.seen) >= p.capacity {
+		p.seen = make(map[uint64]struct{}, p.capacity)
+	}
+	p.seen[k] = struct{}{}
+	p.mu.Unlock()
+	p.accepted.Add(1)
+	return true
+}
 
 func (p *Pool[T]) handleConnect() {
 	n := p.connCount.Add(1)
