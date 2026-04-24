@@ -161,7 +161,7 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 	relayAddr := common.HexToAddress(rp.Address)
 	nonceBig := new(big.Int)
 	nonceBig.SetString(rp.Nonce, 10)
-	gasLimit := uint64(len(calls)) * gasPerCall
+	gasLimit := uint64(len(calls))*gasPerCall + proxyWrapperOverhead
 	gasLimitBig := new(big.Int).SetUint64(gasLimit)
 
 	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")

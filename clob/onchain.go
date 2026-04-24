@@ -28,13 +28,26 @@ const (
 
 const (
 	// gasPerCall is the per-proxy-call gas budget baked into the signed relay
-	// message (gasLimit = len(calls) * gasPerCall). Polymarket's GSN relayer
-	// provisions the on-chain tx gas as ~300k × ops + 250k — so if gasPerCall
-	// exceeds ~300k the RelayHub's `gasleft() >= gasLimit` check reverts the
-	// tx with "Not enough gas left()" before any proxy call runs. 300k is
-	// comfortably above the actual gas cost of approve/split/merge/convert
-	// (50–200k each) while leaving headroom for the relayer's overhead.
-	gasPerCall    = 300_000
+	// message. Polymarket's GSN relayer provisions the on-chain tx gas as
+	// ~300k × ops + 250k — so the *total* signed gasLimit must stay below
+	// that provisioned amount or RelayHub's `gasleft() >= gasLimit` check
+	// reverts with "Not enough gas left()" before any proxy call runs.
+	// 300k per-call is comfortably above the amortized cost of
+	// approve/split/merge/convert (150–200k each when batched).
+	gasPerCall = 300_000
+
+	// proxyWrapperOverhead is a flat gas allowance added to the signed
+	// gasLimit to cover ProxyWalletFactory.proxy's own work: array decode,
+	// per-call forwarding, nonce/signature check. Measured empirically at
+	// ~50k; 100k leaves slack. Without it, N=1 txs OOG — a single-op tx
+	// signs gasLimit=300k and eth_estimateGas on
+	// ProxyWalletFactory.proxy([NegRiskCTF.splitPosition]) returns ~349k.
+	// RelayHub catches the OOG and emits RelayedCallFailed (status=1);
+	// relayer API surfaces it as "relay hub: internal transaction failure".
+	// For N≥2 the wrapper's fixed cost amortizes and 300k×N alone suffices,
+	// but the overhead keeps the budget honest either way. Fits inside the
+	// 250k pre-call cushion between signed gasLimit and provisioned tx gas.
+	proxyWrapperOverhead = 100_000
 	maxUint256Hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	callTypeCall  = 1
 	relayerURL    = "https://relayer-v2.polymarket.com"
