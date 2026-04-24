@@ -161,7 +161,15 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 	relayAddr := common.HexToAddress(rp.Address)
 	nonceBig := new(big.Int)
 	nonceBig.SetString(rp.Nonce, 10)
-	gasLimit := uint64(len(calls))*gasPerCall + proxyWrapperOverhead
+
+	var gasLimit uint64
+	if est, err := oc.estimateProxyGas(ctx, encodedFunction); err == nil {
+		gasLimit = est + gasSlack
+		log.Debug().Uint64("estimate", est).Uint64("gasLimit", gasLimit).Int("ops", len(calls)).Msg("[ONCHAIN] gas_estimated")
+	} else {
+		gasLimit = uint64(len(calls))*fallbackGasPerCall + fallbackWrapperOverhead
+		log.Warn().Err(err).Uint64("gasLimit", gasLimit).Int("ops", len(calls)).Msg("[ONCHAIN] estimate_failed_using_fallback")
+	}
 	gasLimitBig := new(big.Int).SetUint64(gasLimit)
 
 	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")

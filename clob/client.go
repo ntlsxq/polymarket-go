@@ -19,11 +19,7 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/govalues/decimal"
 	"github.com/rs/zerolog/log"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 )
-
-var clobTracer = otel.Tracer("clob")
 
 type Client struct {
 	host       string
@@ -408,10 +404,6 @@ func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]PostO
 		return nil, fmt.Errorf("PostOrders: max 15 orders per batch, got %d", len(orders))
 	}
 
-	ctx, span := clobTracer.Start(ctx, "clob.post_orders")
-	defer span.End()
-	span.SetAttributes(attribute.Int("count", len(orders)))
-
 	body := make([]map[string]any, len(orders))
 	for i, arg := range orders {
 		body[i] = map[string]any{
@@ -423,45 +415,24 @@ func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]PostO
 		}
 	}
 
-	start := time.Now()
 	raw, err := c.doPost(ctx, EndpointPostOrders, body)
-	span.SetAttributes(attribute.Int64("http_ms", time.Since(start).Milliseconds()))
 	if err != nil {
-		span.SetAttributes(attribute.Bool("error", true), attribute.String("err", err.Error()))
 		return nil, err
 	}
 
 	var result []PostOrderResponse
 	if err := json.Unmarshal(raw, &result); err != nil {
-		span.SetAttributes(attribute.Bool("error", true), attribute.String("err", "parse"))
 		return nil, fmt.Errorf("parse post_orders response: %w", err)
 	}
 	return result, nil
 }
 
 func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) error {
-	ctx, span := clobTracer.Start(ctx, "clob.cancel_orders")
-	defer span.End()
-	span.SetAttributes(attribute.Int("count", len(orderIDs)))
-
-	start := time.Now()
 	_, err := c.doDelete(ctx, EndpointCancelOrders, orderIDs)
-	span.SetAttributes(attribute.Int64("http_ms", time.Since(start).Milliseconds()))
-	if err != nil {
-		span.SetAttributes(attribute.Bool("error", true), attribute.String("err", err.Error()))
-	}
 	return err
 }
 
 func (c *Client) CancelAll(ctx context.Context) error {
-	ctx, span := clobTracer.Start(ctx, "clob.cancel_all")
-	defer span.End()
-
-	start := time.Now()
 	_, err := c.doDelete(ctx, EndpointCancelAll, nil)
-	span.SetAttributes(attribute.Int64("http_ms", time.Since(start).Milliseconds()))
-	if err != nil {
-		span.SetAttributes(attribute.Bool("error", true), attribute.String("err", err.Error()))
-	}
 	return err
 }

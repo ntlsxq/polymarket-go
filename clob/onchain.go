@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/rs/zerolog/log"
 )
 
@@ -27,27 +29,24 @@ const (
 )
 
 const (
-	// gasPerCall is the per-proxy-call gas budget baked into the signed relay
-	// message. Polymarket's GSN relayer provisions the on-chain tx gas as
-	// ~300k × ops + 250k — so the *total* signed gasLimit must stay below
-	// that provisioned amount or RelayHub's `gasleft() >= gasLimit` check
-	// reverts with "Not enough gas left()" before any proxy call runs.
-	// 300k per-call is comfortably above the amortized cost of
-	// approve/split/merge/convert (150–200k each when batched).
-	gasPerCall = 300_000
+	// gasSlack is a flat buffer added to eth_estimateGas output to absorb
+	// EIP-2929 cold/warm SLOAD drift between simulation and execution, plus
+	// the from-address mismatch (estimate runs from oc.fromAddr, actual
+	// msg.sender at execution is RelayHub→relay). Drift is additive (a few
+	// cold SLOAD transitions), not proportional — so we use a constant, not
+	// a percentage. 30k covers ~10-15 cold→warm transitions with slack.
+	gasSlack = 30_000
 
-	// proxyWrapperOverhead is a flat gas allowance added to the signed
-	// gasLimit to cover ProxyWalletFactory.proxy's own work: array decode,
-	// per-call forwarding, nonce/signature check. Measured empirically at
-	// ~50k; 100k leaves slack. Without it, N=1 txs OOG — a single-op tx
-	// signs gasLimit=300k and eth_estimateGas on
-	// ProxyWalletFactory.proxy([NegRiskCTF.splitPosition]) returns ~349k.
-	// RelayHub catches the OOG and emits RelayedCallFailed (status=1);
-	// relayer API surfaces it as "relay hub: internal transaction failure".
-	// For N≥2 the wrapper's fixed cost amortizes and 300k×N alone suffices,
-	// but the overhead keeps the budget honest either way. Fits inside the
-	// 250k pre-call cushion between signed gasLimit and provisioned tx gas.
-	proxyWrapperOverhead = 100_000
+	// Fallback gas constants — used only when eth_estimateGas fails.
+	// Polymarket's GSN relayer provisions on-chain tx gas as ~300k × ops +
+	// 250k, so total signed gasLimit must stay below that or RelayHub's
+	// `gasleft() >= gasLimit` check reverts before any proxy call runs.
+	// 300k per-call covers approve/split/merge/convert (150–200k each);
+	// the 100k wrapper overhead covers ProxyWalletFactory.proxy's array
+	// decode + per-call forwarding, measured at ~50k with slack.
+	fallbackGasPerCall      = 300_000
+	fallbackWrapperOverhead = 100_000
+
 	maxUint256Hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	callTypeCall  = 1
 	relayerURL    = "https://relayer-v2.polymarket.com"
@@ -117,6 +116,7 @@ type TxResult struct {
 
 type OnChainClient struct {
 	relayerClient  *http.Client
+	eth            *ethclient.Client
 	privKey        *ecdsa.PrivateKey
 	fromAddr       common.Address
 	factoryAddr    common.Address
@@ -132,6 +132,7 @@ type OnChainClient struct {
 type OnChainConfig struct {
 	PrivateKey    *ecdsa.PrivateKey
 	RelayerAPIKey string
+	PolygonRPC    string
 }
 
 func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
@@ -142,6 +143,14 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 	if cfg.RelayerAPIKey == "" {
 		return nil, fmt.Errorf("OnChainConfig.RelayerAPIKey is required")
 	}
+	if cfg.PolygonRPC == "" {
+		return nil, fmt.Errorf("OnChainConfig.PolygonRPC is required")
+	}
+
+	eth, err := ethclient.Dial(cfg.PolygonRPC)
+	if err != nil {
+		return nil, fmt.Errorf("dial polygon rpc: %w", err)
+	}
 
 	fromAddr := crypto.PubkeyToAddress(cfg.PrivateKey.PublicKey)
 
@@ -149,6 +158,7 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 		relayerClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		eth:            eth,
 		privKey:        cfg.PrivateKey,
 		fromAddr:       fromAddr,
 		factoryAddr:    common.HexToAddress(ProxyWalletFactoryAddr),
@@ -161,7 +171,24 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 	}, nil
 }
 
-func (oc *OnChainClient) Close() {}
+func (oc *OnChainClient) Close() {
+	if oc.eth != nil {
+		oc.eth.Close()
+	}
+}
+
+// estimateProxyGas calls eth_estimateGas on ProxyWalletFactory.proxy(calls)
+// from the signer EOA. Returns the raw estimate; the caller adds gasSlack.
+// A non-nil error means the static fallback should be used.
+func (oc *OnChainClient) estimateProxyGas(ctx context.Context, encodedFunction []byte) (uint64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return oc.eth.EstimateGas(ctx, ethereum.CallMsg{
+		From: oc.fromAddr,
+		To:   &oc.factoryAddr,
+		Data: encodedFunction,
+	})
+}
 
 func (oc *OnChainClient) SplitPosition(ctx context.Context, conditionId string, amount int, negRisk bool) (string, error) {
 	target, calldata, err := oc.packSplitMerge("splitPosition", conditionId, amount, negRisk)
