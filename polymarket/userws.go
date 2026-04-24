@@ -2,12 +2,14 @@ package polymarket
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/goccy/go-json"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 
+	"github.com/ntlsxq/polymarket-go/book"
 	"github.com/ntlsxq/polymarket-go/clob"
 )
 
@@ -98,15 +100,17 @@ type Fill struct {
 }
 
 type UserWS struct {
-	creds        *clob.ApiCreds
-	conditionIDs []string
-	events       WSEventLogger
-	onFill       func(Fill)
-	onOrder      func(OrderEvent)
-	onReconnect  func()
-	onConnect    func()
-	onDisconnect func()
-	filter       func(raw []byte) bool
+	creds         *clob.ApiCreds
+	conditionIDs  []string
+	events        WSEventLogger
+	onFill        func(Fill)
+	onOrder       func(OrderEvent)
+	onReconnect   func()
+	onConnect     func()
+	onDisconnect  func()
+	filter        func(raw []byte) bool
+	books         *book.Manager
+	onPriceChange func()
 
 	connected bool
 }
@@ -144,6 +148,16 @@ func (u *UserWS) SetFilter(fn func(raw []byte) bool) { u.filter = fn }
 // SetOnConnect / SetOnDisconnect let a Pool aggregate connection state.
 func (u *UserWS) SetOnConnect(fn func())    { u.onConnect = fn }
 func (u *UserWS) SetOnDisconnect(fn func()) { u.onDisconnect = fn }
+
+// SetBooks wires the book Manager so maker-side fills decrement the consumed
+// level immediately. Same Manager as the MarketWS pool so IngestTrade dedup
+// catches the same transaction_hash arriving via both feeds.
+func (u *UserWS) SetBooks(b *book.Manager) { u.books = b }
+
+// SetOnPriceChange fires after a fill successfully mutates the book (dedup
+// passed). Mirrors MarketWS's callback so consumers wire one priceBus for
+// both streams.
+func (u *UserWS) SetOnPriceChange(fn func()) { u.onPriceChange = fn }
 
 func (u *UserWS) Connected() bool { return u.connected }
 
@@ -217,9 +231,59 @@ func (u *UserWS) dispatchTrade(raw []byte) {
 	if fill.Status != FillStatusMatched {
 		return
 	}
+	u.ingestFillToBook(fill)
 	if u.onFill != nil {
 		u.onFill(fill)
 	}
+}
+
+// ingestFillToBook routes a matched Fill through book.Manager.IngestTrade,
+// which dedupes by transaction_hash against the same set market-ws
+// last_trade_price uses — so whichever feed wins the race is the one that
+// decrements the level. Fires onPriceChange only on actual mutation (dedup
+// returned true AND the level was present).
+func (u *UserWS) ingestFillToBook(fill Fill) {
+	if u.books == nil {
+		return
+	}
+	trade, tokenID, ok := fillToTrade(fill)
+	if !ok {
+		return
+	}
+	if !u.books.IngestTrade(tokenID, trade) {
+		return
+	}
+	if u.onPriceChange != nil {
+		u.onPriceChange()
+	}
+}
+
+// fillToTrade projects a UserWS Fill into the same book.Trade shape the
+// market-ws last_trade_price handler produces. Fill.Side is the TAKER side
+// on the top-level AssetID — matches book.ApplyTrade's "tradeSide" contract
+// directly (no inversion).
+func fillToTrade(fill Fill) (book.Trade, string, bool) {
+	if fill.AssetID == "" {
+		return book.Trade{}, "", false
+	}
+	side, ok := book.ParseSide(string(fill.Side))
+	if !ok {
+		return book.Trade{}, "", false
+	}
+	p, err := strconv.ParseFloat(fill.Price, 64)
+	if err != nil || p <= 0 {
+		return book.Trade{}, "", false
+	}
+	s, err := strconv.ParseFloat(fill.Size, 64)
+	if err != nil || s <= 0 {
+		return book.Trade{}, "", false
+	}
+	return book.Trade{
+		Hash:  fill.TransactionHash,
+		Side:  side,
+		Price: p,
+		Size:  s,
+	}, fill.AssetID, true
 }
 
 func (u *UserWS) dispatchOrder(raw []byte) {

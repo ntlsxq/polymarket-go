@@ -184,59 +184,112 @@ func (ws *MarketWS) dispatch(raw []byte) {
 func (ws *MarketWS) handle(msg map[string]any) bool {
 	switch msg["event_type"] {
 	case "book":
-		aid, _ := msg["asset_id"].(string)
-		ob := ws.books.OBForToken(aid)
-		if ob == nil {
-			return false
-		}
-		ob.SetFromSnapshot(parseLevels(msg["bids"]), parseLevels(msg["asks"]))
-		return true
-
+		return ws.handleBook(msg)
 	case "price_change":
-		changes, _ := msg["price_changes"].([]any)
-		changed := false
-		for _, c := range changes {
-			ch, _ := c.(map[string]any)
-			aid, _ := ch["asset_id"].(string)
-			ob := ws.books.OBForToken(aid)
-			if ob == nil {
-				continue
-			}
-			p, _ := strconv.ParseFloat(ch["price"].(string), 64)
-			s := 0.0
-			if sv, ok := ch["size"].(string); ok {
-				s, _ = strconv.ParseFloat(sv, 64)
-			}
-			side, _ := ch["side"].(string)
-			ob.UpdateLevel(side, p, s)
-			changed = true
-		}
-		return changed
-
+		return ws.handlePriceChange(msg)
 	case "best_bid_ask":
-		aid, _ := msg["asset_id"].(string)
-		ob := ws.books.OBForToken(aid)
-		if ob == nil {
-			return false
-		}
-		bb, _ := strconv.ParseFloat(firstString(msg, "best_bid"), 64)
-		ba, _ := strconv.ParseFloat(firstString(msg, "best_ask"), 64)
-		ob.ReconcileTop(bb, ba)
-		return true
-
+		return ws.handleBestBidAsk(msg)
+	case "last_trade_price":
+		return ws.handleLastTradePrice(msg)
 	case "tick_size_change":
-		aid, _ := msg["asset_id"].(string)
-		tick := firstString(msg, "tick_size", "minimum_tick_size")
-		if aid != "" && tick != "" {
-			ws.books.SetTickSize(aid, tick)
-			if ws.onTickSizeChange != nil {
-				ws.onTickSizeChange(aid, tick)
-			}
-			return true
-		}
-
+		return ws.handleTickSizeChange(msg)
 	}
 	return false
+}
+
+func (ws *MarketWS) handleBook(msg map[string]any) bool {
+	aid, _ := msg["asset_id"].(string)
+	ob := ws.books.OBForToken(aid)
+	if ob == nil {
+		return false
+	}
+	ob.SetFromSnapshot(parseLevels(msg["bids"]), parseLevels(msg["asks"]))
+	return true
+}
+
+func (ws *MarketWS) handlePriceChange(msg map[string]any) bool {
+	changes, _ := msg["price_changes"].([]any)
+	changed := false
+	for _, c := range changes {
+		ch, _ := c.(map[string]any)
+		aid, _ := ch["asset_id"].(string)
+		ob := ws.books.OBForToken(aid)
+		if ob == nil {
+			continue
+		}
+		sideStr, _ := ch["side"].(string)
+		side, ok := book.ParseSide(sideStr)
+		if !ok {
+			continue
+		}
+		priceStr, _ := ch["price"].(string)
+		p, _ := strconv.ParseFloat(priceStr, 64)
+		s := 0.0
+		if sv, ok := ch["size"].(string); ok {
+			s, _ = strconv.ParseFloat(sv, 64)
+		}
+		ob.UpdateLevel(side, p, s)
+		changed = true
+	}
+	return changed
+}
+
+func (ws *MarketWS) handleBestBidAsk(msg map[string]any) bool {
+	aid, _ := msg["asset_id"].(string)
+	ob := ws.books.OBForToken(aid)
+	if ob == nil {
+		return false
+	}
+	bb, _ := strconv.ParseFloat(firstString(msg, "best_bid"), 64)
+	ba, _ := strconv.ParseFloat(firstString(msg, "best_ask"), 64)
+	ob.ReconcileTop(bb, ba)
+	return true
+}
+
+func (ws *MarketWS) handleLastTradePrice(msg map[string]any) bool {
+	trade, tokenID, ok := parseLastTradePrice(msg)
+	if !ok {
+		return false
+	}
+	return ws.books.IngestTrade(tokenID, trade)
+}
+
+func (ws *MarketWS) handleTickSizeChange(msg map[string]any) bool {
+	aid, _ := msg["asset_id"].(string)
+	tick := firstString(msg, "tick_size", "minimum_tick_size")
+	if aid == "" || tick == "" {
+		return false
+	}
+	ws.books.SetTickSize(aid, tick)
+	if ws.onTickSizeChange != nil {
+		ws.onTickSizeChange(aid, tick)
+	}
+	return true
+}
+
+// parseLastTradePrice extracts a typed book.Trade from a market-ws
+// last_trade_price frame. Returns ok=false when any required field is
+// missing or invalid, so the dispatcher can drop the frame without
+// touching the book.
+func parseLastTradePrice(msg map[string]any) (book.Trade, string, bool) {
+	tokenID, _ := msg["asset_id"].(string)
+	sideStr, _ := msg["side"].(string)
+	side, ok := book.ParseSide(sideStr)
+	if !ok {
+		return book.Trade{}, "", false
+	}
+	p, _ := strconv.ParseFloat(firstString(msg, "price"), 64)
+	s, _ := strconv.ParseFloat(firstString(msg, "size"), 64)
+	if p <= 0 || s <= 0 {
+		return book.Trade{}, "", false
+	}
+	hash, _ := msg["transaction_hash"].(string)
+	return book.Trade{
+		Hash:  hash,
+		Side:  side,
+		Price: p,
+		Size:  s,
+	}, tokenID, true
 }
 
 func parseLevels(v any) []book.BookLevel {

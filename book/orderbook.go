@@ -191,13 +191,13 @@ func (ob *OrderBook) BidLevels() []BookLevel {
 	return levels
 }
 
-func (ob *OrderBook) UpdateLevel(side string, price float64, size float64) {
+func (ob *OrderBook) UpdateLevel(side Side, price float64, size float64) {
 	pk := ToInt(price)
 
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	if side == "BUY" {
+	if side == SideBuy {
 		if size <= 0 {
 			delete(ob.bids, pk)
 		} else {
@@ -211,6 +211,54 @@ func (ob *OrderBook) UpdateLevel(side string, price float64, size float64) {
 			ob.asks[pk] = size
 		}
 		ob.recomputeAsks()
+	}
+	ob.version.Add(1)
+}
+
+// ApplyTrade decrements a single level by the traded size, simulating the
+// consumption that a trade event reports. side is the TAKER side: SideBuy
+// consumes asks at price, SideSell consumes bids. No-op if the level is
+// absent from our local snapshot (the subsequent price_change / book diff
+// will reconcile). Bumps version so MM's dirty-tracking picks up the
+// mutation.
+//
+// Used to front-run price_change by seconds: last_trade_price arrives from
+// the CLOB immediately on match, price_change follows with a p50 ≈ 74ms,
+// p95 ≈ 3s lag for the same underlying event.
+func (ob *OrderBook) ApplyTrade(side Side, price, size float64) {
+	if price <= 0 || size <= 0 {
+		return
+	}
+	pk := ToInt(price)
+
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
+	switch side {
+	case SideBuy:
+		cur, ok := ob.asks[pk]
+		if !ok {
+			return
+		}
+		if remaining := cur - size; remaining <= 0 {
+			delete(ob.asks, pk)
+		} else {
+			ob.asks[pk] = remaining
+		}
+		ob.recomputeAsks()
+	case SideSell:
+		cur, ok := ob.bids[pk]
+		if !ok {
+			return
+		}
+		if remaining := cur - size; remaining <= 0 {
+			delete(ob.bids, pk)
+		} else {
+			ob.bids[pk] = remaining
+		}
+		ob.recomputeBids()
+	default:
+		return
 	}
 	ob.version.Add(1)
 }

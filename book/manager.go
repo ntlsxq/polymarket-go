@@ -14,6 +14,11 @@ type Manager struct {
 	tidToKey  map[string]string
 	tidIsYes  map[string]bool
 	tickSizes sync.Map
+
+	// trades dedupes book-mutating trade events by transaction_hash so
+	// consumers (last_trade_price from market ws + maker fills from UserWS)
+	// can feed the same trade without double-decrementing a level.
+	trades *tradeDedup
 }
 
 func NewManager(tokens []Token) *Manager {
@@ -21,6 +26,7 @@ func NewManager(tokens []Token) *Manager {
 		books:    make(map[string]*BookPair),
 		tidToKey: make(map[string]string, len(tokens)),
 		tidIsYes: make(map[string]bool, len(tokens)),
+		trades:   newTradeDedup(defaultSeenTradesCapacity),
 	}
 	for _, t := range tokens {
 		if _, ok := m.books[t.Key]; !ok {
@@ -112,4 +118,21 @@ func (m *Manager) GetTickSize(tokenID string) string {
 		return ""
 	}
 	return v.(string)
+}
+
+// IngestTrade applies t to the book for tokenID, deduping by t.Hash so the
+// same on-chain tx reported through two streams only decrements the level
+// once. Returns true when the trade resolves to a known book and passes the
+// dedup; callers (event dispatchers) use that to decide whether the book
+// was dirtied.
+func (m *Manager) IngestTrade(tokenID string, t Trade) bool {
+	ob := m.OBForToken(tokenID)
+	if ob == nil {
+		return false
+	}
+	if !m.trades.markSeen(t.Hash) {
+		return false
+	}
+	ob.ApplyTrade(t.Side, t.Price, t.Size)
+	return true
 }
