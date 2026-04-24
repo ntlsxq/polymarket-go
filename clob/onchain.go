@@ -27,7 +27,14 @@ const (
 )
 
 const (
-	gasPerCall    = 1_000_000
+	// gasPerCall is the per-proxy-call gas budget baked into the signed relay
+	// message (gasLimit = len(calls) * gasPerCall). Polymarket's GSN relayer
+	// provisions the on-chain tx gas as ~300k × ops + 250k — so if gasPerCall
+	// exceeds ~300k the RelayHub's `gasleft() >= gasLimit` check reverts the
+	// tx with "Not enough gas left()" before any proxy call runs. 300k is
+	// comfortably above the actual gas cost of approve/split/merge/convert
+	// (50–200k each) while leaving headroom for the relayer's overhead.
+	gasPerCall    = 300_000
 	maxUint256Hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	callTypeCall  = 1
 	relayerURL    = "https://relayer-v2.polymarket.com"
