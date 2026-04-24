@@ -101,15 +101,24 @@ func (p *Pool[T]) Run(ctx context.Context) {
 // Connected reports whether at least one member currently has a live socket.
 func (p *Pool[T]) Connected() bool { return p.connCount.Load() > 0 }
 
-// Members exposes the underlying slice for domain-specific fan-out
-// (e.g. MarketWS.SubscribeTokens on each).
+// Members exposes the underlying slice for cases where a caller needs the
+// raw list. Prefer Each for fan-out.
 func (p *Pool[T]) Members() []T { return p.members }
+
+// Each applies fn to every member. This is the single primitive for domain
+// fan-out — callers express per-member operations as a closure, e.g.:
+//
+//	pool.Each(func(ws *polymarket.MarketWS) { ws.SubscribeTokens(ids) })
+//	pool.Each(func(ws *polymarket.UserWS)   { ws.SetOnFill(onFill) })
+func (p *Pool[T]) Each(fn func(T)) {
+	for _, m := range p.members {
+		fn(m)
+	}
+}
 
 // SetEventLog fans out the event sink to every member.
 func (p *Pool[T]) SetEventLog(el WSEventLogger) {
-	for _, m := range p.members {
-		m.SetEventLog(el)
-	}
+	p.Each(func(m T) { m.SetEventLog(el) })
 }
 
 // Stats returns cumulative (accepted, dropped) frames. In a 2-member pool
@@ -155,60 +164,3 @@ func (p *Pool[T]) handleDisconnect() {
 	}
 }
 
-// UserPool is Pool[*UserWS] + domain fan-outs: setting an order/fill
-// handler on the pool installs it on every member. Run/Connected/Stats
-// etc. come through the embedded *Pool.
-type UserPool struct {
-	*Pool[*UserWS]
-}
-
-// NewUserPool wraps the generic Pool with UserWS-specific fan-outs.
-func NewUserPool(members []*UserWS, opts ...PoolOption[*UserWS]) *UserPool {
-	return &UserPool{Pool: NewPool[*UserWS](members, opts...)}
-}
-
-// SetOnOrder installs fn on every member.
-func (p *UserPool) SetOnOrder(fn func(OrderEvent)) {
-	for _, ws := range p.Members() {
-		ws.SetOnOrder(fn)
-	}
-}
-
-// SetOnFill installs fn on every member.
-func (p *UserPool) SetOnFill(fn func(Fill)) {
-	for _, ws := range p.Members() {
-		ws.SetOnFill(fn)
-	}
-}
-
-// SetOnReconnect installs fn on every member.
-func (p *UserPool) SetOnReconnect(fn func()) {
-	for _, ws := range p.Members() {
-		ws.SetOnReconnect(fn)
-	}
-}
-
-// MarketPool is Pool[*MarketWS] + MarketWS-specific fan-outs (subscribe /
-// unsubscribe tokens across all members).
-type MarketPool struct {
-	*Pool[*MarketWS]
-}
-
-// NewMarketPool wraps the generic Pool with MarketWS-specific fan-outs.
-func NewMarketPool(members []*MarketWS, opts ...PoolOption[*MarketWS]) *MarketPool {
-	return &MarketPool{Pool: NewPool[*MarketWS](members, opts...)}
-}
-
-// SubscribeTokens fans out the subscription to every member.
-func (p *MarketPool) SubscribeTokens(tokenIDs []string) {
-	for _, ws := range p.Members() {
-		ws.SubscribeTokens(tokenIDs)
-	}
-}
-
-// UnsubscribeTokens fans out the unsubscription to every member.
-func (p *MarketPool) UnsubscribeTokens(tokenIDs []string) {
-	for _, ws := range p.Members() {
-		ws.UnsubscribeTokens(tokenIDs)
-	}
-}
