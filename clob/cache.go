@@ -3,11 +3,19 @@ package clob
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/goccy/go-json"
 )
+
+type feeRateResponse struct {
+	BaseFee flexInt64 `json:"base_fee"`
+}
+
+type tickSizeResponse struct {
+	MinimumTickSize flexString `json:"minimum_tick_size"`
+	TickSize        flexString `json:"tick_size"`
+}
 
 // GetFeeRate fetches the CLOB base_fee (signed-order FeeRateBps, distinct
 // from the strategy fee coefficient on Market.FeeRate). Called at bootstrap
@@ -19,19 +27,11 @@ func (c *Client) GetFeeRate(ctx context.Context, tokenID string) (int64, error) 
 		return 0, err
 	}
 
-	var result map[string]any
+	var result feeRateResponse
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return 0, err
 	}
-
-	switch v := result["base_fee"].(type) {
-	case float64:
-		return int64(v), nil
-	case string:
-		rate, _ := strconv.ParseInt(v, 10, 64)
-		return rate, nil
-	}
-	return 0, nil
+	return int64(result.BaseFee), nil
 }
 
 func (c *Client) GetTickSize(ctx context.Context, tokenID string) (string, error) {
@@ -52,26 +52,16 @@ func (c *Client) GetTickSize(ctx context.Context, tokenID string) (string, error
 
 	var tickSize string
 	if err := json.Unmarshal(raw, &tickSize); err != nil {
-		var obj map[string]any
+		var obj tickSizeResponse
 		if err2 := json.Unmarshal(raw, &obj); err2 != nil {
 			return "", fmt.Errorf("parse tick_size response: %w", err)
 		}
-		val, exists := obj["minimum_tick_size"]
-		if !exists {
-			val, exists = obj["tick_size"]
+		tickSize = string(obj.MinimumTickSize)
+		if tickSize == "" {
+			tickSize = string(obj.TickSize)
 		}
-		if !exists {
+		if tickSize == "" {
 			return "", fmt.Errorf("unexpected tick_size response: %s", string(raw))
-		}
-		switch v := val.(type) {
-		case string:
-			tickSize = v
-		case float64:
-			tickSize = strconv.FormatFloat(v, 'f', -1, 64)
-		case json.Number:
-			tickSize = v.String()
-		default:
-			return "", fmt.Errorf("unexpected tick_size type %T in response: %s", val, string(raw))
 		}
 	}
 

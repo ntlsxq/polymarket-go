@@ -117,6 +117,26 @@ type proxyCallArg struct {
 	Data     []byte
 }
 
+type relayerSignatureParams struct {
+	GasPrice   string `json:"gasPrice"`
+	RelayerFee string `json:"relayerFee"`
+	GasLimit   string `json:"gasLimit"`
+	Relay      string `json:"relay"`
+	RelayHub   string `json:"relayHub"`
+}
+
+type relayerSubmitBody struct {
+	Type            string                 `json:"type"`
+	From            string                 `json:"from"`
+	To              string                 `json:"to"`
+	ProxyWallet     string                 `json:"proxyWallet"`
+	Data            string                 `json:"data"`
+	Value           string                 `json:"value"`
+	Nonce           string                 `json:"nonce"`
+	Signature       string                 `json:"signature"`
+	SignatureParams relayerSignatureParams `json:"signatureParams"`
+}
+
 func (oc *OnChainClient) sendProxyTx(ctx context.Context, target common.Address, calldata []byte) (string, error) {
 	return oc.sendProxyTxBatch(ctx, []proxyCallArg{{callTypeCall, target, big.NewInt(0), calldata}})
 }
@@ -198,21 +218,21 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 	sigBytes[64] += 27
 
 	proxyWallet := deriveProxyWallet(oc.fromAddr)
-	submitBody := map[string]any{
-		"type":        "PROXY",
-		"from":        strings.ToLower(oc.fromAddr.Hex()),
-		"to":          strings.ToLower(oc.factoryAddr.Hex()),
-		"proxyWallet": strings.ToLower(proxyWallet.Hex()),
-		"data":        "0x" + hex.EncodeToString(encodedFunction),
-		"value":       "0",
-		"nonce":       rp.Nonce,
-		"signature":   "0x" + hex.EncodeToString(sigBytes),
-		"signatureParams": map[string]string{
-			"gasPrice":   "0",
-			"relayerFee": "0",
-			"gasLimit":   fmt.Sprintf("%d", gasLimit),
-			"relay":      strings.ToLower(relayAddr.Hex()),
-			"relayHub":   strings.ToLower(oc.relayHub.Hex()),
+	submitBody := relayerSubmitBody{
+		Type:        "PROXY",
+		From:        strings.ToLower(oc.fromAddr.Hex()),
+		To:          strings.ToLower(oc.factoryAddr.Hex()),
+		ProxyWallet: strings.ToLower(proxyWallet.Hex()),
+		Data:        "0x" + hex.EncodeToString(encodedFunction),
+		Value:       "0",
+		Nonce:       rp.Nonce,
+		Signature:   "0x" + hex.EncodeToString(sigBytes),
+		SignatureParams: relayerSignatureParams{
+			GasPrice:   "0",
+			RelayerFee: "0",
+			GasLimit:   fmt.Sprintf("%d", gasLimit),
+			Relay:      strings.ToLower(relayAddr.Hex()),
+			RelayHub:   strings.ToLower(oc.relayHub.Hex()),
 		},
 	}
 

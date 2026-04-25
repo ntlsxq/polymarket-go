@@ -70,6 +70,35 @@ func LogRTT() {
 	}
 }
 
+// gammaFeeSchedule is the optional event-level fee config. feeRate ships
+// as either a JSON string ("0.072") or number (0.072) — flexFloat handles
+// both.
+type gammaFeeSchedule struct {
+	FeeRate flexFloat `json:"feeRate"`
+}
+
+// gammaMarket is one row inside an event's markets[]. clobTokenIds and
+// outcomePrices are JSON-encoded string arrays embedded in the response
+// — i.e. a string field whose contents must be re-parsed.
+type gammaMarket struct {
+	Slug                  string     `json:"slug"`
+	ConditionID           string     `json:"conditionId"`
+	GroupItemTitle        string     `json:"groupItemTitle"`
+	GroupItemThreshold    flexInt    `json:"groupItemThreshold"`
+	ClobTokenIDs          string     `json:"clobTokenIds"`
+	OutcomePrices         string     `json:"outcomePrices"`
+	OrderPriceMinTickSize flexString `json:"orderPriceMinTickSize"`
+	VolumeNum             flexFloat  `json:"volumeNum"`
+}
+
+type gammaEvent struct {
+	Slug            string            `json:"slug"`
+	NegRiskMarketID string            `json:"negRiskMarketID"`
+	Volume24hr      flexFloat         `json:"volume24hr"`
+	FeeSchedule     *gammaFeeSchedule `json:"feeSchedule,omitempty"`
+	Markets         []gammaMarket     `json:"markets"`
+}
+
 // ScanMarkets queries Polymarket's Gamma API and returns markets matching
 // the given coins and dates. Pass nil for dates to include all dates.
 // Pass an empty coins slice to include none; typical usage is to pass
@@ -97,17 +126,16 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 	var result []Market
 
 	for _, ev := range events {
-		slug, _ := ev["slug"].(string)
-		if slug == "" {
+		if ev.Slug == "" {
 			continue
 		}
-		if !strings.Contains(slug, "-above-") && !strings.Contains(slug, "-price-") {
+		if !strings.Contains(ev.Slug, "-above-") && !strings.Contains(ev.Slug, "-price-") {
 			continue
 		}
 
 		var coin string
 		for c := range coinSet {
-			if strings.HasPrefix(slug, c) {
+			if strings.HasPrefix(ev.Slug, c) {
 				coin = c
 				break
 			}
@@ -117,12 +145,12 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 		}
 
 		var etype, dateStr string
-		if i := strings.LastIndex(slug, "-above-on-"); i >= 0 {
+		if i := strings.LastIndex(ev.Slug, "-above-on-"); i >= 0 {
 			etype = "above"
-			dateStr = slug[i+len("-above-on-"):]
-		} else if i := strings.LastIndex(slug, "-price-on-"); i >= 0 {
+			dateStr = ev.Slug[i+len("-above-on-"):]
+		} else if i := strings.LastIndex(ev.Slug, "-price-on-"); i >= 0 {
 			etype = "range"
-			dateStr = slug[i+len("-price-on-"):]
+			dateStr = ev.Slug[i+len("-price-on-"):]
 		} else {
 			continue
 		}
@@ -137,40 +165,21 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 			}
 		}
 
-		negRiskMarketID, _ := ev["negRiskMarketID"].(string)
+		eventFeeRate := 0.0
+		if ev.FeeSchedule != nil {
+			eventFeeRate = float64(ev.FeeSchedule.FeeRate)
+		}
 
-		eventFeeRate := parseFeeSchedule(ev)
-
-		marketsRaw, _ := ev["markets"].([]any)
-		for _, mRaw := range marketsRaw {
-			m, ok := mRaw.(map[string]any)
-			if !ok {
-				continue
-			}
-			tids, err := jsonStringArray(m, "clobTokenIds")
+		for _, m := range ev.Markets {
+			tids, err := decodeJSONStringArray(m.ClobTokenIDs)
 			if err != nil || len(tids) < 2 {
 				continue
 			}
 
-			prices, _ := jsonStringArray(m, "outcomePrices")
+			prices, _ := decodeJSONStringArray(m.OutcomePrices)
 			var mid float64
 			if len(prices) > 0 {
 				mid, _ = strconv.ParseFloat(prices[0], 64)
-			}
-
-			threshold := 0
-			if v, ok := m["groupItemThreshold"]; ok {
-				threshold = anyInt(v)
-			}
-
-			title, _ := m["groupItemTitle"].(string)
-			conditionID, _ := m["conditionId"].(string)
-			var tickSize string
-			switch v := m["orderPriceMinTickSize"].(type) {
-			case float64:
-				tickSize = strconv.FormatFloat(v, 'f', -1, 64)
-			case string:
-				tickSize = v
 			}
 
 			coinShort := CoinShort[coin]
@@ -178,23 +187,23 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 				coinShort = strings.ToUpper(coin[:3])
 			}
 
-			mk := NewMarket(coin, coinShort, dateStr, etype, title,
-				threshold, tids[0], tids[1], mid, conditionID, tickSize)
+			mk := NewMarket(coin, coinShort, dateStr, etype, m.GroupItemTitle,
+				int(m.GroupItemThreshold), tids[0], tids[1], mid, m.ConditionID, string(m.OrderPriceMinTickSize))
 			mk.FeeRate = eventFeeRate
-			if mSlug, _ := m["slug"].(string); mSlug != "" {
-				mk.Slug = mSlug
+			if m.Slug != "" {
+				mk.Slug = m.Slug
 			} else {
-				mk.Slug = slug
+				mk.Slug = ev.Slug
 			}
 
-			if vn, ok := m["volumeNum"].(float64); ok && vn > 0 {
+			if vn := float64(m.VolumeNum); vn > 0 {
 				mk.Volume24h = vn
-			} else if v24, ok := ev["volume24hr"].(float64); ok {
-				mk.Volume24h = v24 / float64(len(marketsRaw))
+			} else if v24 := float64(ev.Volume24hr); v24 > 0 {
+				mk.Volume24h = v24 / float64(len(ev.Markets))
 			}
-			if negRiskMarketID != "" && etype == "range" {
-				mk.NegRiskMarketID = negRiskMarketID
-				mk.QuestionIndex = DeriveQuestionIndex(negRiskMarketID, conditionID)
+			if ev.NegRiskMarketID != "" && etype == "range" {
+				mk.NegRiskMarketID = ev.NegRiskMarketID
+				mk.QuestionIndex = DeriveQuestionIndex(ev.NegRiskMarketID, m.ConditionID)
 			}
 			result = append(result, mk)
 		}
@@ -219,8 +228,8 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 	return result, nil
 }
 
-func fetchEvents(client *http.Client) ([]map[string]any, error) {
-	var all []map[string]any
+func fetchEvents(client *http.Client) ([]gammaEvent, error) {
+	var all []gammaEvent
 	for offset := 0; offset < maxPages*100; offset += 100 {
 		url := fmt.Sprintf("%s/events?tag_slug=crypto&active=true&closed=false&limit=100&offset=%d",
 			gammaAPI, offset)
@@ -228,13 +237,13 @@ func fetchEvents(client *http.Client) ([]map[string]any, error) {
 		if err != nil {
 			break
 		}
-		var batch []map[string]any
+		var batch []gammaEvent
 		if json.Unmarshal(body, &batch) != nil {
-			var single map[string]any
+			var single gammaEvent
 			if json.Unmarshal(body, &single) != nil {
 				break
 			}
-			batch = []map[string]any{single}
+			batch = []gammaEvent{single}
 		}
 		if len(batch) == 0 {
 			break
@@ -277,8 +286,10 @@ func backoff(attempt int) {
 	}
 }
 
-func jsonStringArray(m map[string]any, key string) ([]string, error) {
-	raw, _ := m[key].(string)
+// decodeJSONStringArray parses a JSON-encoded string-array field (Polymarket
+// embeds clobTokenIds / outcomePrices as a stringified JSON array inside the
+// outer JSON document).
+func decodeJSONStringArray(raw string) ([]string, error) {
 	if raw == "" {
 		raw = "[]"
 	}
@@ -293,54 +304,15 @@ func FetchMarketTokens(marketID string) (yesTID, noTID string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("fetch market %s: %w", marketID, err)
 	}
-	var m map[string]any
+	var m gammaMarket
 	if err := json.Unmarshal(body, &m); err != nil {
 		return "", "", fmt.Errorf("parse market %s: %w", marketID, err)
 	}
-	tids, err := jsonStringArray(m, "clobTokenIds")
+	tids, err := decodeJSONStringArray(m.ClobTokenIDs)
 	if err != nil || len(tids) < 2 {
 		return "", "", fmt.Errorf("market %s: missing clobTokenIds", marketID)
 	}
 	return tids[0], tids[1], nil
-}
-
-func parseFeeSchedule(ev map[string]any) float64 {
-	fs, ok := ev["feeSchedule"]
-	if !ok || fs == nil {
-		return 0
-	}
-
-	var feeRateRaw any
-	switch v := fs.(type) {
-	case map[string]any:
-		feeRateRaw = v["feeRate"]
-	default:
-		return 0
-	}
-
-	switch r := feeRateRaw.(type) {
-	case float64:
-		return r
-	case string:
-		f, err := strconv.ParseFloat(r, 64)
-		if err != nil {
-			return 0
-		}
-		return f
-	default:
-		return 0
-	}
-}
-
-func anyInt(v any) int {
-	switch x := v.(type) {
-	case float64:
-		return int(x)
-	case string:
-		n, _ := strconv.Atoi(x)
-		return n
-	}
-	return 0
 }
 
 func DeriveQuestionIndex(marketID, targetConditionID string) int {

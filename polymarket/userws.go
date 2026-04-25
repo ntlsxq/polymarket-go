@@ -17,6 +17,18 @@ type WSEventLogger interface {
 	LogWSEvent(ts time.Time, stream, event string, raw []byte)
 }
 
+type userSubscribeAuth struct {
+	ApiKey     string `json:"apiKey"`
+	Secret     string `json:"secret"`
+	Passphrase string `json:"passphrase"`
+}
+
+type userSubscribe struct {
+	Auth    userSubscribeAuth `json:"auth"`
+	Markets []string          `json:"markets"`
+	Type    string            `json:"type"`
+}
+
 type TraderSide string
 
 const (
@@ -166,14 +178,14 @@ func (u *UserWS) Run(ctx context.Context) {
 		tag: "USER_WS",
 		url: WSUser,
 		onConnect: func(conn *websocket.Conn) error {
-			sub := map[string]any{
-				"auth": map[string]string{
-					"apiKey":     u.creds.ApiKey,
-					"secret":     u.creds.ApiSecret,
-					"passphrase": u.creds.ApiPassphrase,
+			sub := userSubscribe{
+				Auth: userSubscribeAuth{
+					ApiKey:     u.creds.ApiKey,
+					Secret:     u.creds.ApiSecret,
+					Passphrase: u.creds.ApiPassphrase,
 				},
-				"markets": u.conditionIDs,
-				"type":    "user",
+				Markets: u.conditionIDs,
+				Type:    "user",
 			}
 			if err := conn.WriteJSON(sub); err != nil {
 				return err

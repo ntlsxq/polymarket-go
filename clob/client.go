@@ -379,12 +379,10 @@ func (c *Client) PostOrder(ctx context.Context, signedOrder *SignedOrder, orderT
 		return nil, fmt.Errorf("PostOrder: signedOrder is nil")
 	}
 
-	body := map[string]any{
-		"order":     signedOrder.Dict(),
-		"owner":     c.creds.ApiKey,
-		"orderType": orderType,
-		"postOnly":  false,
-		"deferExec": false,
+	body := PostOrderRequest{
+		Order:     signedOrder.Marshal(),
+		Owner:     c.creds.ApiKey,
+		OrderType: orderType,
 	}
 
 	raw, err := c.doPost(ctx, EndpointPostOrder, body)
@@ -404,14 +402,14 @@ func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]PostO
 		return nil, fmt.Errorf("PostOrders: max 15 orders per batch, got %d", len(orders))
 	}
 
-	body := make([]map[string]any, len(orders))
+	body := make([]PostOrderRequest, len(orders))
 	for i, arg := range orders {
-		body[i] = map[string]any{
-			"order":     arg.Order.Dict(),
-			"owner":     c.creds.ApiKey,
-			"orderType": arg.OrderType,
-			"postOnly":  arg.PostOnly,
-			"deferExec": arg.DeferExec,
+		body[i] = PostOrderRequest{
+			Order:     arg.Order.Marshal(),
+			Owner:     c.creds.ApiKey,
+			OrderType: arg.OrderType,
+			PostOnly:  arg.PostOnly,
+			DeferExec: arg.DeferExec,
 		}
 	}
 

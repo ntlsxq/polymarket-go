@@ -175,10 +175,14 @@ type HeartbeatResponse struct {
 	HeartbeatID string `json:"heartbeat_id"`
 }
 
+type heartbeatRequest struct {
+	HeartbeatID *string `json:"heartbeat_id"`
+}
+
 func (c *Client) PostHeartbeat(ctx context.Context, heartbeatID string) (*HeartbeatResponse, error) {
-	body := map[string]any{"heartbeat_id": nil}
+	var body heartbeatRequest
 	if heartbeatID != "" {
-		body["heartbeat_id"] = heartbeatID
+		body.HeartbeatID = &heartbeatID
 	}
 
 	raw, err := c.doPost(ctx, EndpointPostHeartbeat, body)

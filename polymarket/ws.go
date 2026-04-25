@@ -14,6 +14,65 @@ import (
 	"github.com/ntlsxq/polymarket-go/book"
 )
 
+// Outbound subscribe payload for the market-WS endpoint.
+type marketSubscribe struct {
+	AssetsIDs            []string `json:"assets_ids"`
+	Type                 string   `json:"type"`
+	Operation            string   `json:"operation,omitempty"`
+	InitialDump          bool     `json:"initial_dump,omitempty"`
+	Level                int      `json:"level,omitempty"`
+	CustomFeatureEnabled bool     `json:"custom_feature_enabled,omitempty"`
+}
+
+// Inbound market-WS event shapes. flexFloat lets price/size arrive as either
+// string or number — Polymarket is inconsistent across event types.
+type wsEnvelope struct {
+	EventType string `json:"event_type"`
+}
+
+type wsBookLevel struct {
+	Price flexFloat `json:"price"`
+	Size  flexFloat `json:"size"`
+}
+
+type wsBookMsg struct {
+	AssetID string        `json:"asset_id"`
+	Bids    []wsBookLevel `json:"bids"`
+	Asks    []wsBookLevel `json:"asks"`
+}
+
+type wsPriceChangeEntry struct {
+	AssetID string `json:"asset_id"`
+	Side    string `json:"side"`
+	Price   string `json:"price"`
+	Size    string `json:"size"`
+}
+
+type wsPriceChangeMsg struct {
+	PriceChanges []wsPriceChangeEntry `json:"price_changes"`
+}
+
+type wsBestBidAskMsg struct {
+	AssetID string `json:"asset_id"`
+	BestBid string `json:"best_bid"`
+	BestAsk string `json:"best_ask"`
+}
+
+type wsLastTradePriceMsg struct {
+	AssetID         string `json:"asset_id"`
+	Side            string `json:"side"`
+	Price           string `json:"price"`
+	Size            string `json:"size"`
+	TransactionHash string `json:"transaction_hash"`
+}
+
+type wsTickSizeChangeMsg struct {
+	AssetID         string `json:"asset_id"`
+	TickSize        string `json:"tick_size"`
+	MinimumTickSize string `json:"minimum_tick_size"`
+}
+
+
 const wsMarketURL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 type MarketWS struct {
@@ -74,10 +133,10 @@ func (ws *MarketWS) SubscribeTokens(tokenIDs []string) {
 	if ws.conn == nil {
 		return
 	}
-	ws.conn.WriteJSON(map[string]any{
-		"assets_ids": tokenIDs,
-		"type":       "market",
-		"operation":  "subscribe",
+	ws.conn.WriteJSON(marketSubscribe{
+		AssetsIDs: tokenIDs,
+		Type:      "market",
+		Operation: "subscribe",
 	})
 }
 
@@ -87,10 +146,10 @@ func (ws *MarketWS) UnsubscribeTokens(tokenIDs []string) {
 	if ws.conn == nil {
 		return
 	}
-	ws.conn.WriteJSON(map[string]any{
-		"assets_ids": tokenIDs,
-		"type":       "market",
-		"operation":  "unsubscribe",
+	ws.conn.WriteJSON(marketSubscribe{
+		AssetsIDs: tokenIDs,
+		Type:      "market",
+		Operation: "unsubscribe",
 	})
 }
 
@@ -104,15 +163,15 @@ func (ws *MarketWS) Run(ctx context.Context) {
 		url: wsMarketURL,
 		onConnect: func(conn *websocket.Conn) error {
 			for i, batch := range batches {
-				msg := map[string]any{
-					"assets_ids":             batch,
-					"type":                   "market",
-					"initial_dump":           true,
-					"level":                  2,
-					"custom_feature_enabled": true,
+				msg := marketSubscribe{
+					AssetsIDs:            batch,
+					Type:                 "market",
+					InitialDump:          true,
+					Level:                2,
+					CustomFeatureEnabled: true,
 				}
 				if i > 0 {
-					msg["operation"] = "subscribe"
+					msg.Operation = "subscribe"
 				}
 				if err := conn.WriteJSON(msg); err != nil {
 					return err
@@ -164,15 +223,14 @@ func (ws *MarketWS) dispatch(raw []byte) {
 	}
 	changed := false
 	for _, item := range items {
-		var msg map[string]any
-		if json.Unmarshal(item, &msg) != nil {
+		var env wsEnvelope
+		if json.Unmarshal(item, &env) != nil {
 			continue
 		}
 		if ws.events != nil {
-			evType, _ := msg["event_type"].(string)
-			ws.events.LogWSEvent(recvTs, "market", evType, item)
+			ws.events.LogWSEvent(recvTs, "market", env.EventType, item)
 		}
-		if ws.handle(msg) {
+		if ws.handle(env.EventType, item) {
 			changed = true
 		}
 	}
@@ -181,72 +239,82 @@ func (ws *MarketWS) dispatch(raw []byte) {
 	}
 }
 
-func (ws *MarketWS) handle(msg map[string]any) bool {
-	switch msg["event_type"] {
+func (ws *MarketWS) handle(evType string, raw json.RawMessage) bool {
+	switch evType {
 	case "book":
+		var msg wsBookMsg
+		if json.Unmarshal(raw, &msg) != nil {
+			return false
+		}
 		return ws.handleBook(msg)
 	case "price_change":
+		var msg wsPriceChangeMsg
+		if json.Unmarshal(raw, &msg) != nil {
+			return false
+		}
 		return ws.handlePriceChange(msg)
 	case "best_bid_ask":
+		var msg wsBestBidAskMsg
+		if json.Unmarshal(raw, &msg) != nil {
+			return false
+		}
 		return ws.handleBestBidAsk(msg)
 	case "last_trade_price":
+		var msg wsLastTradePriceMsg
+		if json.Unmarshal(raw, &msg) != nil {
+			return false
+		}
 		return ws.handleLastTradePrice(msg)
 	case "tick_size_change":
+		var msg wsTickSizeChangeMsg
+		if json.Unmarshal(raw, &msg) != nil {
+			return false
+		}
 		return ws.handleTickSizeChange(msg)
 	}
 	return false
 }
 
-func (ws *MarketWS) handleBook(msg map[string]any) bool {
-	aid, _ := msg["asset_id"].(string)
-	ob := ws.books.OBForToken(aid)
+func (ws *MarketWS) handleBook(msg wsBookMsg) bool {
+	ob := ws.books.OBForToken(msg.AssetID)
 	if ob == nil {
 		return false
 	}
-	ob.SetFromSnapshot(parseLevels(msg["bids"]), parseLevels(msg["asks"]))
+	ob.SetFromSnapshot(toBookLevels(msg.Bids), toBookLevels(msg.Asks))
 	return true
 }
 
-func (ws *MarketWS) handlePriceChange(msg map[string]any) bool {
-	changes, _ := msg["price_changes"].([]any)
+func (ws *MarketWS) handlePriceChange(msg wsPriceChangeMsg) bool {
 	changed := false
-	for _, c := range changes {
-		ch, _ := c.(map[string]any)
-		aid, _ := ch["asset_id"].(string)
-		ob := ws.books.OBForToken(aid)
+	for _, ch := range msg.PriceChanges {
+		ob := ws.books.OBForToken(ch.AssetID)
 		if ob == nil {
 			continue
 		}
-		sideStr, _ := ch["side"].(string)
-		side, ok := book.ParseSide(sideStr)
+		side, ok := book.ParseSide(ch.Side)
 		if !ok {
 			continue
 		}
-		priceStr, _ := ch["price"].(string)
-		p, _ := strconv.ParseFloat(priceStr, 64)
-		s := 0.0
-		if sv, ok := ch["size"].(string); ok {
-			s, _ = strconv.ParseFloat(sv, 64)
-		}
+		p, _ := strconv.ParseFloat(ch.Price, 64)
+		s, _ := strconv.ParseFloat(ch.Size, 64)
 		ob.UpdateLevel(side, p, s)
 		changed = true
 	}
 	return changed
 }
 
-func (ws *MarketWS) handleBestBidAsk(msg map[string]any) bool {
-	aid, _ := msg["asset_id"].(string)
-	ob := ws.books.OBForToken(aid)
+func (ws *MarketWS) handleBestBidAsk(msg wsBestBidAskMsg) bool {
+	ob := ws.books.OBForToken(msg.AssetID)
 	if ob == nil {
 		return false
 	}
-	bb, _ := strconv.ParseFloat(firstString(msg, "best_bid"), 64)
-	ba, _ := strconv.ParseFloat(firstString(msg, "best_ask"), 64)
+	bb, _ := strconv.ParseFloat(msg.BestBid, 64)
+	ba, _ := strconv.ParseFloat(msg.BestAsk, 64)
 	ob.ReconcileTop(bb, ba)
 	return true
 }
 
-func (ws *MarketWS) handleLastTradePrice(msg map[string]any) bool {
+func (ws *MarketWS) handleLastTradePrice(msg wsLastTradePriceMsg) bool {
 	trade, tokenID, ok := parseLastTradePrice(msg)
 	if !ok {
 		return false
@@ -254,15 +322,17 @@ func (ws *MarketWS) handleLastTradePrice(msg map[string]any) bool {
 	return ws.books.IngestTrade(tokenID, trade)
 }
 
-func (ws *MarketWS) handleTickSizeChange(msg map[string]any) bool {
-	aid, _ := msg["asset_id"].(string)
-	tick := firstString(msg, "tick_size", "minimum_tick_size")
-	if aid == "" || tick == "" {
+func (ws *MarketWS) handleTickSizeChange(msg wsTickSizeChangeMsg) bool {
+	tick := msg.TickSize
+	if tick == "" {
+		tick = msg.MinimumTickSize
+	}
+	if msg.AssetID == "" || tick == "" {
 		return false
 	}
-	ws.books.SetTickSize(aid, tick)
+	ws.books.SetTickSize(msg.AssetID, tick)
 	if ws.onTickSizeChange != nil {
-		ws.onTickSizeChange(aid, tick)
+		ws.onTickSizeChange(msg.AssetID, tick)
 	}
 	return true
 }
@@ -271,59 +341,32 @@ func (ws *MarketWS) handleTickSizeChange(msg map[string]any) bool {
 // last_trade_price frame. Returns ok=false when any required field is
 // missing or invalid, so the dispatcher can drop the frame without
 // touching the book.
-func parseLastTradePrice(msg map[string]any) (book.Trade, string, bool) {
-	tokenID, _ := msg["asset_id"].(string)
-	sideStr, _ := msg["side"].(string)
-	side, ok := book.ParseSide(sideStr)
+func parseLastTradePrice(msg wsLastTradePriceMsg) (book.Trade, string, bool) {
+	side, ok := book.ParseSide(msg.Side)
 	if !ok {
 		return book.Trade{}, "", false
 	}
-	p, _ := strconv.ParseFloat(firstString(msg, "price"), 64)
-	s, _ := strconv.ParseFloat(firstString(msg, "size"), 64)
+	p, _ := strconv.ParseFloat(msg.Price, 64)
+	s, _ := strconv.ParseFloat(msg.Size, 64)
 	if p <= 0 || s <= 0 {
 		return book.Trade{}, "", false
 	}
-	hash, _ := msg["transaction_hash"].(string)
 	return book.Trade{
-		Hash:  hash,
+		Hash:  msg.TransactionHash,
 		Side:  side,
 		Price: p,
 		Size:  s,
-	}, tokenID, true
+	}, msg.AssetID, true
 }
 
-func parseLevels(v any) []book.BookLevel {
-	arr, _ := v.([]any)
-	out := make([]book.BookLevel, 0, len(arr))
-	for _, e := range arr {
-		m, _ := e.(map[string]any)
-		p := anyFloat(m["price"])
-		s := anyFloat(m["size"])
-		if p > 0 {
-			out = append(out, book.BookLevel{Price: p, Size: s})
+func toBookLevels(in []wsBookLevel) []book.BookLevel {
+	out := make([]book.BookLevel, 0, len(in))
+	for _, e := range in {
+		if e.Price > 0 {
+			out = append(out, book.BookLevel{Price: float64(e.Price), Size: float64(e.Size)})
 		}
 	}
 	return out
-}
-
-func anyFloat(v any) float64 {
-	switch x := v.(type) {
-	case string:
-		f, _ := strconv.ParseFloat(x, 64)
-		return f
-	case float64:
-		return x
-	}
-	return 0
-}
-
-func firstString(m map[string]any, keys ...string) string {
-	for _, k := range keys {
-		if s, ok := m[k].(string); ok && s != "" {
-			return s
-		}
-	}
-	return ""
 }
 
 func batchStrings(s []string, size int) [][]string {

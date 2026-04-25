@@ -230,33 +230,45 @@ type SignedOrder struct {
 	Signature string
 }
 
-func (so *SignedOrder) Dict() map[string]any {
+// SignedOrderJSON is the wire shape of a signed order accepted by the CLOB
+// /order and /orders endpoints. Salt is emitted as a JSON number (big.Int's
+// MarshalJSON renders decimal digits) — every other amount is a decimal
+// string per Polymarket's API.
+type SignedOrderJSON struct {
+	Salt          *big.Int `json:"salt"`
+	Maker         string   `json:"maker"`
+	Signer        string   `json:"signer"`
+	Taker         string   `json:"taker"`
+	TokenID       string   `json:"tokenId"`
+	MakerAmount   string   `json:"makerAmount"`
+	TakerAmount   string   `json:"takerAmount"`
+	Expiration    string   `json:"expiration"`
+	Nonce         string   `json:"nonce"`
+	FeeRateBps    string   `json:"feeRateBps"`
+	Side          string   `json:"side"`
+	SignatureType int      `json:"signatureType"`
+	Signature     string   `json:"signature"`
+}
+
+func (so *SignedOrder) Marshal() SignedOrderJSON {
 	side := SideBuy
 	if so.Order.Side == SideSellInt {
 		side = SideSell
 	}
-
-	var salt any
-	if so.Order.Salt.IsInt64() {
-		salt = so.Order.Salt.Int64()
-	} else {
-		salt = so.Order.Salt
-	}
-
-	return map[string]any{
-		"salt":          salt,
-		"maker":         so.Order.Maker.Hex(),
-		"signer":        so.Order.Signer.Hex(),
-		"taker":         so.Order.Taker.Hex(),
-		"tokenId":       so.Order.TokenID.String(),
-		"makerAmount":   so.Order.MakerAmount.String(),
-		"takerAmount":   so.Order.TakerAmount.String(),
-		"expiration":    so.Order.Expiration.String(),
-		"nonce":         so.Order.Nonce.String(),
-		"feeRateBps":    so.Order.FeeRateBps.String(),
-		"side":          side,
-		"signatureType": so.Order.SignatureType,
-		"signature":     so.Signature,
+	return SignedOrderJSON{
+		Salt:          so.Order.Salt,
+		Maker:         so.Order.Maker.Hex(),
+		Signer:        so.Order.Signer.Hex(),
+		Taker:         so.Order.Taker.Hex(),
+		TokenID:       so.Order.TokenID.String(),
+		MakerAmount:   so.Order.MakerAmount.String(),
+		TakerAmount:   so.Order.TakerAmount.String(),
+		Expiration:    so.Order.Expiration.String(),
+		Nonce:         so.Order.Nonce.String(),
+		FeeRateBps:    so.Order.FeeRateBps.String(),
+		Side:          side,
+		SignatureType: so.Order.SignatureType,
+		Signature:     so.Signature,
 	}
 }
 
@@ -265,6 +277,16 @@ type PostOrderArg struct {
 	OrderType string
 	PostOnly  bool
 	DeferExec bool
+}
+
+// PostOrderRequest is the wire shape for POST /order. PostOrders submits
+// a JSON array of these.
+type PostOrderRequest struct {
+	Order     SignedOrderJSON `json:"order"`
+	Owner     string          `json:"owner"`
+	OrderType string          `json:"orderType"`
+	PostOnly  bool            `json:"postOnly"`
+	DeferExec bool            `json:"deferExec"`
 }
 
 type ApiCreds struct {
