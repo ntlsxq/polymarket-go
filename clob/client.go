@@ -347,7 +347,48 @@ func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size flo
 	}, nil
 }
 
+// pow10Int is a small lookup for 10^n with n ∈ [0..6]. Used by the
+// integer fast path in computeOrderAmounts.
+var pow10Int = [7]int64{1, 10, 100, 1000, 10000, 100000, 1000000}
+
+// tokenDecimalsExp = log10(TokenDecimals) = 6.
+const tokenDecimalsExp = 6
+
+// computeOrderAmounts returns the side-flag plus maker/taker amounts in
+// 6-decimal token units (USDC for the price-side, CTF shares for the
+// size-side). For the standard Polymarket tick configs (rc.Size = 2,
+// rc.Price ∈ {1..4}) it runs a pure int64 path: zero allocs, no decimal
+// library overhead, and bit-exact result vs. the decimal reference path
+// because the multiplications stay in Z (e.g. for BUY:
+// sizeCents × priceTicks × 10^(4 − rc.Price) cancels the 100 × 10^Price
+// denominator against TokenDecimals=10^6 exactly).
+//
+// Anything outside that grid falls back to the decimal path so non-
+// standard configs still get the correct rounding semantics.
 func computeOrderAmounts(side string, size, price float64, rc RoundConfig) (sideInt int, makerAmount, takerAmount int64) {
+	if rc.Size != 2 || rc.Price < 1 || rc.Price > 4 || size < 0 || price < 0 {
+		return computeOrderAmountsDecimal(side, size, price, rc)
+	}
+
+	sizeUnits := int64(math.Floor(size * float64(pow10Int[rc.Size])))
+	priceUnits := int64(math.Round(price * float64(pow10Int[rc.Price])))
+
+	sharesScale := pow10Int[tokenDecimalsExp-rc.Size]
+	usdcScale := pow10Int[tokenDecimalsExp-rc.Size-rc.Price]
+
+	sharesUnits := sizeUnits * sharesScale
+	usdcUnits := sizeUnits * priceUnits * usdcScale
+
+	if side == SideBuy {
+		return SideBuyInt, usdcUnits, sharesUnits
+	}
+	return SideSellInt, sharesUnits, usdcUnits
+}
+
+// computeOrderAmountsDecimal is the original arbitrary-precision path,
+// kept as a fallback for non-standard tick configurations and as a
+// reference for parity tests.
+func computeOrderAmountsDecimal(side string, size, price float64, rc RoundConfig) (sideInt int, makerAmount, takerAmount int64) {
 	dPrice, _ := decimal.NewFromFloat64(price)
 	dPrice = dPrice.Round(rc.Price)
 	dSize, _ := decimal.NewFromFloat64(size)
