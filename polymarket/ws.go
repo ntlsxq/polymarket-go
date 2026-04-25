@@ -26,19 +26,10 @@ type marketSubscribe struct {
 
 // Inbound market-WS event shapes. flexFloat lets price/size arrive as either
 // string or number — Polymarket is inconsistent across event types.
-type wsEnvelope struct {
-	EventType string `json:"event_type"`
-}
 
 type wsBookLevel struct {
 	Price flexFloat `json:"price"`
 	Size  flexFloat `json:"size"`
-}
-
-type wsBookMsg struct {
-	AssetID string        `json:"asset_id"`
-	Bids    []wsBookLevel `json:"bids"`
-	Asks    []wsBookLevel `json:"asks"`
 }
 
 type wsPriceChangeEntry struct {
@@ -48,28 +39,46 @@ type wsPriceChangeEntry struct {
 	Size    string `json:"size"`
 }
 
-type wsPriceChangeMsg struct {
-	PriceChanges []wsPriceChangeEntry `json:"price_changes"`
-}
+// wsItem is the union shape used by dispatch to decode every event type
+// in one Unmarshal pass. Each event populates only its own subset of
+// fields; goccy/go-json silently skips JSON keys we don't list and leaves
+// unrelated struct fields zero. This collapses what was previously two
+// passes (envelope-only, then typed-message) into one.
+type wsItem struct {
+	EventType string `json:"event_type"`
 
-type wsBestBidAskMsg struct {
 	AssetID string `json:"asset_id"`
+
+	// book
+	Bids []wsBookLevel `json:"bids"`
+	Asks []wsBookLevel `json:"asks"`
+
+	// price_change
+	PriceChanges []wsPriceChangeEntry `json:"price_changes"`
+
+	// best_bid_ask
 	BestBid string `json:"best_bid"`
 	BestAsk string `json:"best_ask"`
+
+	// last_trade_price
+	Side            string `json:"side"`
+	Price           string `json:"price"`
+	Size            string `json:"size"`
+	TransactionHash string `json:"transaction_hash"`
+
+	// tick_size_change
+	TickSize        string `json:"tick_size"`
+	MinimumTickSize string `json:"minimum_tick_size"`
 }
 
+// wsLastTradePriceMsg is the payload-only projection used by parseLastTradePrice
+// for unit tests; its fields are a strict subset of wsItem.
 type wsLastTradePriceMsg struct {
 	AssetID         string `json:"asset_id"`
 	Side            string `json:"side"`
 	Price           string `json:"price"`
 	Size            string `json:"size"`
 	TransactionHash string `json:"transaction_hash"`
-}
-
-type wsTickSizeChangeMsg struct {
-	AssetID         string `json:"asset_id"`
-	TickSize        string `json:"tick_size"`
-	MinimumTickSize string `json:"minimum_tick_size"`
 }
 
 
@@ -212,129 +221,141 @@ func (ws *MarketWS) Run(ctx context.Context) {
 	})
 }
 
+// dispatch routes one wire frame through the per-event handlers. Polymarket
+// emits both wrapped arrays ([{...},{...}]) and bare objects ({...}); we
+// branch on the first non-whitespace byte instead of attempting an array
+// unmarshal first, which dropped one alloc + one parse on every object
+// frame in the baseline. Each item is then decoded once into its typed
+// shape (envelope-only decode is gone — handle() unmarshals into the same
+// struct that carries the event_type tag, so envelope and payload share a
+// single Unmarshal pass).
 func (ws *MarketWS) dispatch(raw []byte) {
 	if ws.filter != nil && !ws.filter(raw) {
 		return
 	}
 	recvTs := time.Now()
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
-		items = []json.RawMessage{raw}
+
+	if first := firstNonSpace(raw); first == '[' {
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) != nil {
+			return
+		}
+		changed := false
+		for _, item := range items {
+			if ws.dispatchOne(recvTs, item) {
+				changed = true
+			}
+		}
+		if changed && ws.onPriceChange != nil {
+			ws.onPriceChange()
+		}
+		return
 	}
-	changed := false
-	for _, item := range items {
-		var env wsEnvelope
-		if json.Unmarshal(item, &env) != nil {
-			continue
-		}
-		if ws.events != nil {
-			ws.events.LogWSEvent(recvTs, "market", env.EventType, item)
-		}
-		if ws.handle(env.EventType, item) {
-			changed = true
-		}
-	}
-	if changed && ws.onPriceChange != nil {
+
+	if ws.dispatchOne(recvTs, raw) && ws.onPriceChange != nil {
 		ws.onPriceChange()
 	}
 }
 
-func (ws *MarketWS) handle(evType string, raw json.RawMessage) bool {
-	switch evType {
+// firstNonSpace returns the first non-whitespace byte of b, or 0 when b
+// is whitespace-only or empty.
+func firstNonSpace(b []byte) byte {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			return c
+		}
+	}
+	return 0
+}
+
+// dispatchOne decodes a single item once into wsItem (union of all event
+// shapes) and routes by EventType. One Unmarshal pass per item replaces
+// the previous envelope+payload double-decode.
+func (ws *MarketWS) dispatchOne(recvTs time.Time, raw json.RawMessage) bool {
+	var it wsItem
+	if json.Unmarshal(raw, &it) != nil {
+		return false
+	}
+	if ws.events != nil {
+		ws.events.LogWSEvent(recvTs, "market", it.EventType, raw)
+	}
+	return ws.handleItem(&it)
+}
+
+func (ws *MarketWS) handleItem(it *wsItem) bool {
+	switch it.EventType {
 	case "book":
-		var msg wsBookMsg
-		if json.Unmarshal(raw, &msg) != nil {
+		ob := ws.books.OBForToken(it.AssetID)
+		if ob == nil {
 			return false
 		}
-		return ws.handleBook(msg)
+		ob.SetFromSnapshot(toBookLevels(it.Bids), toBookLevels(it.Asks))
+		return true
+
 	case "price_change":
-		var msg wsPriceChangeMsg
-		if json.Unmarshal(raw, &msg) != nil {
-			return false
+		changed := false
+		for i := range it.PriceChanges {
+			ch := &it.PriceChanges[i]
+			ob := ws.books.OBForToken(ch.AssetID)
+			if ob == nil {
+				continue
+			}
+			side, ok := book.ParseSide(ch.Side)
+			if !ok {
+				continue
+			}
+			p, _ := strconv.ParseFloat(ch.Price, 64)
+			s, _ := strconv.ParseFloat(ch.Size, 64)
+			ob.UpdateLevel(side, p, s)
+			changed = true
 		}
-		return ws.handlePriceChange(msg)
+		return changed
+
 	case "best_bid_ask":
-		var msg wsBestBidAskMsg
-		if json.Unmarshal(raw, &msg) != nil {
+		ob := ws.books.OBForToken(it.AssetID)
+		if ob == nil {
 			return false
 		}
-		return ws.handleBestBidAsk(msg)
+		bb, _ := strconv.ParseFloat(it.BestBid, 64)
+		ba, _ := strconv.ParseFloat(it.BestAsk, 64)
+		ob.ReconcileTop(bb, ba)
+		return true
+
 	case "last_trade_price":
-		var msg wsLastTradePriceMsg
-		if json.Unmarshal(raw, &msg) != nil {
+		side, ok := book.ParseSide(it.Side)
+		if !ok {
 			return false
 		}
-		return ws.handleLastTradePrice(msg)
+		p, _ := strconv.ParseFloat(it.Price, 64)
+		s, _ := strconv.ParseFloat(it.Size, 64)
+		if p <= 0 || s <= 0 {
+			return false
+		}
+		return ws.books.IngestTrade(it.AssetID, book.Trade{
+			Hash:  it.TransactionHash,
+			Side:  side,
+			Price: p,
+			Size:  s,
+		})
+
 	case "tick_size_change":
-		var msg wsTickSizeChangeMsg
-		if json.Unmarshal(raw, &msg) != nil {
+		tick := it.TickSize
+		if tick == "" {
+			tick = it.MinimumTickSize
+		}
+		if it.AssetID == "" || tick == "" {
 			return false
 		}
-		return ws.handleTickSizeChange(msg)
+		ws.books.SetTickSize(it.AssetID, tick)
+		if ws.onTickSizeChange != nil {
+			ws.onTickSizeChange(it.AssetID, tick)
+		}
+		return true
 	}
 	return false
-}
-
-func (ws *MarketWS) handleBook(msg wsBookMsg) bool {
-	ob := ws.books.OBForToken(msg.AssetID)
-	if ob == nil {
-		return false
-	}
-	ob.SetFromSnapshot(toBookLevels(msg.Bids), toBookLevels(msg.Asks))
-	return true
-}
-
-func (ws *MarketWS) handlePriceChange(msg wsPriceChangeMsg) bool {
-	changed := false
-	for _, ch := range msg.PriceChanges {
-		ob := ws.books.OBForToken(ch.AssetID)
-		if ob == nil {
-			continue
-		}
-		side, ok := book.ParseSide(ch.Side)
-		if !ok {
-			continue
-		}
-		p, _ := strconv.ParseFloat(ch.Price, 64)
-		s, _ := strconv.ParseFloat(ch.Size, 64)
-		ob.UpdateLevel(side, p, s)
-		changed = true
-	}
-	return changed
-}
-
-func (ws *MarketWS) handleBestBidAsk(msg wsBestBidAskMsg) bool {
-	ob := ws.books.OBForToken(msg.AssetID)
-	if ob == nil {
-		return false
-	}
-	bb, _ := strconv.ParseFloat(msg.BestBid, 64)
-	ba, _ := strconv.ParseFloat(msg.BestAsk, 64)
-	ob.ReconcileTop(bb, ba)
-	return true
-}
-
-func (ws *MarketWS) handleLastTradePrice(msg wsLastTradePriceMsg) bool {
-	trade, tokenID, ok := parseLastTradePrice(msg)
-	if !ok {
-		return false
-	}
-	return ws.books.IngestTrade(tokenID, trade)
-}
-
-func (ws *MarketWS) handleTickSizeChange(msg wsTickSizeChangeMsg) bool {
-	tick := msg.TickSize
-	if tick == "" {
-		tick = msg.MinimumTickSize
-	}
-	if msg.AssetID == "" || tick == "" {
-		return false
-	}
-	ws.books.SetTickSize(msg.AssetID, tick)
-	if ws.onTickSizeChange != nil {
-		ws.onTickSizeChange(msg.AssetID, tick)
-	}
-	return true
 }
 
 // parseLastTradePrice extracts a typed book.Trade from a market-ws
