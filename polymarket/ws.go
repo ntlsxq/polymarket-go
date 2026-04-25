@@ -307,9 +307,12 @@ func (ws *MarketWS) handleItem(it *wsItem) bool {
 			if !ok {
 				continue
 			}
-			p, _ := strconv.ParseFloat(ch.Price, 64)
+			pk, ok := book.ParseTick(ch.Price)
+			if !ok {
+				continue
+			}
 			s, _ := strconv.ParseFloat(ch.Size, 64)
-			ob.UpdateLevel(side, p, s)
+			ob.UpdateLevelKey(side, pk, s)
 			changed = true
 		}
 		return changed
@@ -329,15 +332,18 @@ func (ws *MarketWS) handleItem(it *wsItem) bool {
 		if !ok {
 			return false
 		}
-		p, _ := strconv.ParseFloat(it.Price, 64)
+		pk, ok := book.ParseTick(it.Price)
+		if !ok || pk <= 0 {
+			return false
+		}
 		s, _ := strconv.ParseFloat(it.Size, 64)
-		if p <= 0 || s <= 0 {
+		if s <= 0 {
 			return false
 		}
 		return ws.books.IngestTrade(it.AssetID, book.Trade{
 			Hash:  it.TransactionHash,
 			Side:  side,
-			Price: p,
+			Price: book.ToFloat(pk),
 			Size:  s,
 		})
 

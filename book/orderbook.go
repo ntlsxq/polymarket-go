@@ -203,7 +203,14 @@ func sumSizes(levels []BookLevel) float64 {
 }
 
 func (ob *OrderBook) UpdateLevel(side Side, price, size float64) {
-	pk := ToInt(price)
+	ob.UpdateLevelKey(side, ToInt(price), size)
+}
+
+// UpdateLevelKey is the int32-tick-keyed variant of UpdateLevel for callers
+// that already hold a price tick (e.g. ParseTick output on the WS hot path).
+// Skips the ToInt + ToFloat round-trip — the internal slice stores
+// canonical ToFloat(pk) anyway.
+func (ob *OrderBook) UpdateLevelKey(side Side, pk int32, size float64) {
 	normPrice := ToFloat(pk)
 
 	ob.mu.Lock()
@@ -234,7 +241,15 @@ func (ob *OrderBook) ApplyTrade(side Side, price, size float64) {
 	if price <= 0 || size <= 0 {
 		return
 	}
-	pk := ToInt(price)
+	ob.ApplyTradeKey(side, ToInt(price), size)
+}
+
+// ApplyTradeKey is the int32-tick-keyed variant of ApplyTrade. Caller must
+// pass size > 0; pk = 0 is treated as no-op (price <= 0 in the float API).
+func (ob *OrderBook) ApplyTradeKey(side Side, pk int32, size float64) {
+	if pk <= 0 || size <= 0 {
+		return
+	}
 	normPrice := ToFloat(pk)
 
 	ob.mu.Lock()
