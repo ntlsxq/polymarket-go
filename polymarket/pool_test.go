@@ -3,6 +3,7 @@ package polymarket
 import (
 	"context"
 	"fmt"
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,21 +63,41 @@ func TestPoolDistinctContentPassesIndependently(t *testing.T) {
 	}
 }
 
-func TestPoolCapacityResetReadmitsHash(t *testing.T) {
-	p, _ := newStubPool(1)
-	p = NewPool[*stubMember]([]*stubMember{{}}, WithCapacity[*stubMember](2))
-	frame := []byte(`{"x":1}`)
-	other := []byte(`{"x":2}`)
+// TestPoolShardResetReadmitsHash sets per-shard capacity to 1 and crafts
+// three frames that all hash to the same shard, so the second insert
+// triggers a deterministic reset and the original frame is re-admitted.
+func TestPoolShardResetReadmitsHash(t *testing.T) {
+	p := NewPool[*stubMember]([]*stubMember{{}}, WithCapacity[*stubMember](poolShardCount))
 
-	p.members[0].filter(frame)
-	p.members[0].filter(other)
-	// Capacity hit, set resets next insert.
-	if !p.members[0].filter([]byte(`{"x":3}`)) {
-		t.Fatal("third unique frame should reset and accept")
+	var collide [][]byte
+	target := uint64(0xFFFF)
+	for i := 0; len(collide) < 3 && i < 10_000; i++ {
+		f := []byte(fmt.Sprintf(`{"i":%d}`, i))
+		sh := maphash.Bytes(p.seed, f) & poolShardMask
+		if target == 0xFFFF {
+			target = sh
+			collide = append(collide, f)
+			continue
+		}
+		if sh == target {
+			collide = append(collide, f)
+		}
 	}
-	// After reset, the original frame is treated as new again.
-	if !p.members[0].filter(frame) {
-		t.Fatal("after reset, old frame must be accepted again")
+	if len(collide) != 3 {
+		t.Fatalf("could not find 3 colliding frames")
+	}
+
+	if !p.members[0].filter(collide[0]) {
+		t.Fatal("first must accept")
+	}
+	if p.members[0].filter(collide[0]) {
+		t.Fatal("immediate replay must drop")
+	}
+	if !p.members[0].filter(collide[1]) {
+		t.Fatal("second hash to same shard must accept after reset")
+	}
+	if !p.members[0].filter(collide[0]) {
+		t.Fatal("post-reset, original frame must be re-admitted")
 	}
 }
 

@@ -2,6 +2,7 @@ package book
 
 import (
 	"fmt"
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,22 +28,42 @@ func TestTradeDedupNewVsReplay(t *testing.T) {
 	}
 }
 
-func TestTradeDedupCapacityResetOnFull(t *testing.T) {
-	cap := 4
-	d := newTradeDedup(cap)
-	for i := 0; i < cap; i++ {
-		hash := fmt.Sprintf("h%d", i)
-		if !d.markSeen(hash) {
-			t.Fatalf("inserting #%d must succeed", i)
+// TestTradeDedupShardResetReadmitsHash crafts three hashes that all land in
+// the same shard, so we can deterministically assert: with per-shard cap=1,
+// the second hash forces a reset and the first hash is re-admitted afterwards.
+func TestTradeDedupShardResetReadmitsHash(t *testing.T) {
+	d := newTradeDedup(dedupShardCount) // 1 per shard
+	var collide []string
+	target := uint64(0xFFFF)
+	for i := 0; len(collide) < 3 && i < 10_000; i++ {
+		h := fmt.Sprintf("h%d", i)
+		sh := maphash.String(d.seed, h) & dedupShardMask
+		if target == 0xFFFF {
+			target = sh
+			collide = append(collide, h)
+			continue
+		}
+		if sh == target {
+			collide = append(collide, h)
 		}
 	}
-	// Next insert triggers reset; all prior hashes lose memory.
-	if !d.markSeen("h-overflow") {
-		t.Fatal("overflow insert must succeed")
+	if len(collide) != 3 {
+		t.Fatalf("could not find 3 colliding hashes (found %d)", len(collide))
 	}
-	// Old hash should be accepted again because reset wiped state.
-	if !d.markSeen("h0") {
-		t.Fatal("post-reset hash should be treated as new")
+
+	if !d.markSeen(collide[0]) {
+		t.Fatal("first must accept")
+	}
+	if d.markSeen(collide[0]) {
+		t.Fatal("immediate replay must reject")
+	}
+	// Second hash hits the same shard at len==1>=cap=1; shard resets, accepts.
+	if !d.markSeen(collide[1]) {
+		t.Fatal("second hash to same shard must accept after reset")
+	}
+	// Original hash was wiped; should be re-admitted.
+	if !d.markSeen(collide[0]) {
+		t.Fatal("after reset, old hash must be re-admitted")
 	}
 }
 
@@ -74,7 +95,7 @@ func TestTradeDedupConcurrentSingleAcceptor(t *testing.T) {
 
 func TestTradeDedupDefaultCapacity(t *testing.T) {
 	d := newTradeDedup(0)
-	if d.capacity != defaultSeenTradesCapacity {
-		t.Fatalf("default capacity = %d, want %d", d.capacity, defaultSeenTradesCapacity)
+	if got := d.capacity(); got != defaultSeenTradesCapacity {
+		t.Fatalf("default capacity = %d, want %d", got, defaultSeenTradesCapacity)
 	}
 }

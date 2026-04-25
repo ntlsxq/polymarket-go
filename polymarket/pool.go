@@ -2,7 +2,7 @@ package polymarket
 
 import (
 	"context"
-	"hash/fnv"
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 
@@ -23,17 +23,17 @@ type WSMember interface {
 // Pool is a thin wrapper around N parallel WS members of the same type.
 // Identical frames arriving from any two members collapse to one delivery:
 // the first frame with a given content hash flows through, later siblings
-// drop before dispatch. No TTL, no timers — a bounded hash set resets when
-// it fills, which at realistic rates preserves seconds of history.
+// drop before dispatch. No TTL, no timers — bounded per-shard maps reset
+// when full, which at realistic rates preserves seconds of history.
 //
 // Optional onAllDown fires when the last member disconnects (domain hook,
 // e.g. clear stale book atomics).
 type Pool[T WSMember] struct {
 	members []T
 
-	mu       sync.Mutex
-	seen     map[uint64]struct{}
-	capacity int
+	seed     maphash.Seed
+	shards   [poolShardCount]poolShard
+	shardCap int
 
 	connCount atomic.Int32
 	accepted  atomic.Int64
@@ -41,6 +41,19 @@ type Pool[T WSMember] struct {
 
 	onAllDown func()
 	onFirstUp func()
+}
+
+const (
+	poolShardCount = 16
+	poolShardMask  = poolShardCount - 1
+)
+
+// poolShard is padded to a 64-byte cache line to avoid false sharing
+// between adjacent shards under heavy fan-in.
+type poolShard struct {
+	mu   sync.Mutex
+	seen map[uint64]struct{}
+	_    [48]byte
 }
 
 type PoolOption[T WSMember] func(*Pool[T])
@@ -55,12 +68,16 @@ func WithOnFirstUp[T WSMember](fn func()) PoolOption[T] {
 	return func(p *Pool[T]) { p.onFirstUp = fn }
 }
 
-// WithCapacity sets the dedup set's max size (default 4096). The set resets
-// when full, so capacity bounds both memory and max history window.
+// WithCapacity sets the dedup set's per-shard max size (default 256, total
+// 16×256 = 4096). Each shard resets independently when full.
 func WithCapacity[T WSMember](n int) PoolOption[T] {
 	return func(p *Pool[T]) {
 		if n > 0 {
-			p.capacity = n
+			per := n / poolShardCount
+			if per < 1 {
+				per = 1
+			}
+			p.shardCap = per
 		}
 	}
 }
@@ -70,12 +87,15 @@ func WithCapacity[T WSMember](n int) PoolOption[T] {
 func NewPool[T WSMember](members []T, opts ...PoolOption[T]) *Pool[T] {
 	p := &Pool[T]{
 		members:  members,
-		capacity: 4096,
+		seed:     maphash.MakeSeed(),
+		shardCap: 256,
 	}
 	for _, o := range opts {
 		o(p)
 	}
-	p.seen = make(map[uint64]struct{}, p.capacity)
+	for i := range p.shards {
+		p.shards[i].seen = make(map[uint64]struct{}, p.shardCap)
+	}
 	for _, m := range members {
 		m.SetFilter(p.accept)
 		m.SetOnConnect(p.handleConnect)
@@ -128,22 +148,22 @@ func (p *Pool[T]) Stats() (accepted, dropped int64) {
 }
 
 // accept is the filter plugged into each member. First frame with a given
-// content hash wins; siblings drop.
+// content hash wins; siblings drop. Sharded by hash so N goroutines hitting
+// distinct content rarely contend on the same mutex.
 func (p *Pool[T]) accept(raw []byte) bool {
-	h := fnv.New64a()
-	_, _ = h.Write(raw)
-	k := h.Sum64()
-	p.mu.Lock()
-	if _, ok := p.seen[k]; ok {
-		p.mu.Unlock()
+	k := maphash.Bytes(p.seed, raw)
+	sh := &p.shards[k&poolShardMask]
+	sh.mu.Lock()
+	if _, ok := sh.seen[k]; ok {
+		sh.mu.Unlock()
 		p.dropped.Add(1)
 		return false
 	}
-	if len(p.seen) >= p.capacity {
-		p.seen = make(map[uint64]struct{}, p.capacity)
+	if len(sh.seen) >= p.shardCap {
+		sh.seen = make(map[uint64]struct{}, p.shardCap)
 	}
-	p.seen[k] = struct{}{}
-	p.mu.Unlock()
+	sh.seen[k] = struct{}{}
+	sh.mu.Unlock()
 	p.accepted.Add(1)
 	return true
 }
@@ -163,4 +183,3 @@ func (p *Pool[T]) handleDisconnect() {
 		p.onAllDown()
 	}
 }
-
