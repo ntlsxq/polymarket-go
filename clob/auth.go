@@ -62,34 +62,67 @@ const (
 	msgToSign      = "This message attests that I control the given wallet"
 )
 
-var clobAuthTypeHash = keccak256([]byte("ClobAuth(address address,string timestamp,uint256 nonce,string message)"))
+// Pre-computed at init: type hashes and constant-string keccaks. EIP-712
+// encoding hashes constant strings every call; doing it once here saves
+// 5–6 keccak256 invocations + the corresponding allocs per signed order.
+var (
+	clobAuthTypeHash         = keccak256([]byte("ClobAuth(address address,string timestamp,uint256 nonce,string message)"))
+	orderTypeHash            = keccak256([]byte("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"))
+	eip712DomainTypeHashClob = keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId)"))
+	eip712DomainTypeHashCTF  = keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"))
+
+	keccakClobDomainName = keccak256([]byte(clobDomainName))
+	keccakClobVersion    = keccak256([]byte(clobVersion))
+	keccakMsgToSign      = keccak256([]byte(msgToSign))
+	keccakCTFName        = keccak256([]byte("Polymarket CTF Exchange"))
+	keccakOne            = keccak256([]byte("1"))
+)
+
+// writeUint256 writes v as a 32-byte big-endian uint256 into dst[0:32].
+// dst must be exactly 32 bytes; FillBytes zero-pads short values.
+func writeUint256(dst []byte, v *big.Int) {
+	v.FillBytes(dst)
+}
+
+// writeAddress writes addr into the last 20 bytes of dst[0:32], leaving
+// dst[0:12] untouched (caller must pre-zero or use a fresh stack array).
+func writeAddress(dst []byte, addr common.Address) {
+	copy(dst[12:32], addr[:])
+}
+
+// writeUint8 writes v into the last byte of dst[0:32]. Caller pre-zeros.
+func writeUint8(dst []byte, v int) {
+	dst[31] = byte(v)
+}
 
 func buildClobAuthDomainSeparator(chainID int) []byte {
-	domainTypeHash := keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId)"))
-	return keccak256(encodePacked(
-		domainTypeHash,
-		encodeString(clobDomainName),
-		encodeString(clobVersion),
-		encodeUint256(big.NewInt(int64(chainID))),
-	))
+	var buf [4 * 32]byte
+	copy(buf[0:32], eip712DomainTypeHashClob)
+	copy(buf[32:64], keccakClobDomainName)
+	copy(buf[64:96], keccakClobVersion)
+	writeUint256(buf[96:128], big.NewInt(int64(chainID)))
+	return keccak256(buf[:])
 }
 
 func buildClobAuthStructHash(address common.Address, timestamp string, nonce int) []byte {
-	return keccak256(encodePacked(
-		clobAuthTypeHash,
-		encodeAddress(address),
-		encodeString(timestamp),
-		encodeUint256(big.NewInt(int64(nonce))),
-		encodeString(msgToSign),
-	))
+	var buf [5 * 32]byte
+	copy(buf[0:32], clobAuthTypeHash)
+	writeAddress(buf[32:64], address)
+	// timestamp is dynamic — keccak it, but write directly into buf.
+	tsHash := keccak256([]byte(timestamp))
+	copy(buf[64:96], tsHash)
+	writeUint256(buf[96:128], big.NewInt(int64(nonce)))
+	copy(buf[128:160], keccakMsgToSign)
+	return keccak256(buf[:])
 }
 
 func signEIP712Digest(privKey *ecdsa.PrivateKey, domainSeparator, structHash []byte) (string, error) {
-	digest := keccak256(encodePacked(
-		[]byte{0x19, 0x01},
-		domainSeparator,
-		structHash,
-	))
+	var buf [2 + 32 + 32]byte
+	buf[0] = 0x19
+	buf[1] = 0x01
+	copy(buf[2:34], domainSeparator)
+	copy(buf[34:66], structHash)
+	digest := keccak256(buf[:])
 
 	sig, err := crypto.Sign(digest, privKey)
 	if err != nil {
@@ -210,37 +243,32 @@ func L2Headers(creds *ApiCreds, address common.Address, method, path, body strin
 	}, nil
 }
 
-var orderTypeHash = keccak256([]byte(
-	"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
-))
-
 func buildCTFDomainSeparator(chainID int, exchangeAddr common.Address) []byte {
-	domainTypeHash := keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"))
-	return keccak256(encodePacked(
-		domainTypeHash,
-		encodeString("Polymarket CTF Exchange"),
-		encodeString("1"),
-		encodeUint256(big.NewInt(int64(chainID))),
-		encodeAddress(exchangeAddr),
-	))
+	var buf [5 * 32]byte
+	copy(buf[0:32], eip712DomainTypeHashCTF)
+	copy(buf[32:64], keccakCTFName)
+	copy(buf[64:96], keccakOne)
+	writeUint256(buf[96:128], big.NewInt(int64(chainID)))
+	writeAddress(buf[128:160], exchangeAddr)
+	return keccak256(buf[:])
 }
 
 func buildOrderStructHash(order OrderData) []byte {
-	return keccak256(encodePacked(
-		orderTypeHash,
-		encodeUint256(order.Salt),
-		encodeAddress(order.Maker),
-		encodeAddress(order.Signer),
-		encodeAddress(order.Taker),
-		encodeUint256(order.TokenID),
-		encodeUint256(order.MakerAmount),
-		encodeUint256(order.TakerAmount),
-		encodeUint256(order.Expiration),
-		encodeUint256(order.Nonce),
-		encodeUint256(order.FeeRateBps),
-		encodeUint8(order.Side),
-		encodeUint8(order.SignatureType),
-	))
+	var buf [13 * 32]byte
+	copy(buf[0:32], orderTypeHash)
+	writeUint256(buf[32:64], order.Salt)
+	writeAddress(buf[64:96], order.Maker)
+	writeAddress(buf[96:128], order.Signer)
+	writeAddress(buf[128:160], order.Taker)
+	writeUint256(buf[160:192], order.TokenID)
+	writeUint256(buf[192:224], order.MakerAmount)
+	writeUint256(buf[224:256], order.TakerAmount)
+	writeUint256(buf[256:288], order.Expiration)
+	writeUint256(buf[288:320], order.Nonce)
+	writeUint256(buf[320:352], order.FeeRateBps)
+	writeUint8(buf[352:384], order.Side)
+	writeUint8(buf[384:416], order.SignatureType)
+	return keccak256(buf[:])
 }
 
 func SignOrder(privKey *ecdsa.PrivateKey, chainID int, order OrderData, negRisk bool) (string, error) {
