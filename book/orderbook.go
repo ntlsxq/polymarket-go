@@ -58,7 +58,17 @@ type OrderBook struct {
 	hasBids       bool
 	hasAsks       bool
 	sortedAsks    []int32
+	sortedBids    []int32
 	totalAskDepth float64
+
+	// bidLevels / askLevels cache the BookLevel views handed out by
+	// BidLevels() / AskLevels(). Rebuilt under write-lock by recompute*;
+	// readers under RLock just return the slice header. Callers must
+	// treat them as immutable — they're shared. This is what turns 4M
+	// per-tick BidLevels() calls from "sort + alloc + copy" into a pointer
+	// hand-off (the sort dominated CPU per pprof).
+	bidLevels []BookLevel
+	askLevels []BookLevel
 
 	atomicBid atomicBest
 	atomicAsk atomicBest
@@ -143,15 +153,9 @@ func (ob *OrderBook) WorstBidForSize(shares float64) (price float64, filled floa
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
 
-	keys := make([]int32, 0, len(ob.bids))
-	for pk := range ob.bids {
-		keys = append(keys, pk)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] > keys[j] })
-
 	remaining := shares
 	var lastPrice float64
-	for _, pk := range keys {
+	for _, pk := range ob.sortedBids {
 		sz := ob.bids[pk]
 		lastPrice = ToFloat(pk)
 		take := remaining
@@ -166,29 +170,20 @@ func (ob *OrderBook) WorstBidForSize(shares float64) (price float64, filled floa
 	return lastPrice, shares - remaining
 }
 
+// AskLevels returns ascending ask levels. The slice is cached and shared
+// across callers; treat as read-only — mutating it corrupts the OrderBook.
 func (ob *OrderBook) AskLevels() []BookLevel {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
-	levels := make([]BookLevel, len(ob.sortedAsks))
-	for i, pk := range ob.sortedAsks {
-		levels[i] = BookLevel{Price: ToFloat(pk), Size: ob.asks[pk]}
-	}
-	return levels
+	return ob.askLevels
 }
 
+// BidLevels returns descending bid levels. The slice is cached and shared
+// across callers; treat as read-only — mutating it corrupts the OrderBook.
 func (ob *OrderBook) BidLevels() []BookLevel {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
-	keys := make([]int32, 0, len(ob.bids))
-	for pk := range ob.bids {
-		keys = append(keys, pk)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] > keys[j] })
-	levels := make([]BookLevel, len(keys))
-	for i, pk := range keys {
-		levels[i] = BookLevel{Price: ToFloat(pk), Size: ob.bids[pk]}
-	}
-	return levels
+	return ob.bidLevels
 }
 
 func (ob *OrderBook) UpdateLevel(side Side, price float64, size float64) {
@@ -340,21 +335,40 @@ func (ob *OrderBook) SetFromSnapshot(bids, asks []BookLevel) {
 }
 
 func (ob *OrderBook) recomputeBids() {
-	if len(ob.bids) == 0 {
+	n := len(ob.bids)
+	if n == 0 {
 		ob.hasBids = false
 		ob.bidBest = 0
+		ob.sortedBids = ob.sortedBids[:0]
+		ob.bidLevels = ob.bidLevels[:0]
 		ob.atomicBid.clear()
 		return
 	}
 	ob.hasBids = true
-	best := int32(math.MinInt32)
-	for k := range ob.bids {
-		if k > best {
-			best = k
-		}
+
+	if cap(ob.sortedBids) >= n {
+		ob.sortedBids = ob.sortedBids[:0]
+	} else {
+		ob.sortedBids = make([]int32, 0, n)
 	}
-	ob.bidBest = best
-	ob.atomicBid.store(best, ob.bids[best])
+	for pk := range ob.bids {
+		ob.sortedBids = append(ob.sortedBids, pk)
+	}
+	sort.Slice(ob.sortedBids, func(i, j int) bool {
+		return ob.sortedBids[i] > ob.sortedBids[j]
+	})
+
+	if cap(ob.bidLevels) >= n {
+		ob.bidLevels = ob.bidLevels[:n]
+	} else {
+		ob.bidLevels = make([]BookLevel, n)
+	}
+	for i, pk := range ob.sortedBids {
+		ob.bidLevels[i] = BookLevel{Price: ToFloat(pk), Size: ob.bids[pk]}
+	}
+
+	ob.bidBest = ob.sortedBids[0]
+	ob.atomicBid.store(ob.bidBest, ob.bids[ob.bidBest])
 }
 
 func (ob *OrderBook) recomputeAsks() {
@@ -363,6 +377,7 @@ func (ob *OrderBook) recomputeAsks() {
 		ob.hasAsks = false
 		ob.askBest = 0
 		ob.sortedAsks = ob.sortedAsks[:0]
+		ob.askLevels = ob.askLevels[:0]
 		ob.totalAskDepth = 0
 		ob.atomicAsk.clear()
 		return
@@ -383,6 +398,15 @@ func (ob *OrderBook) recomputeAsks() {
 	sort.Slice(ob.sortedAsks, func(i, j int) bool {
 		return ob.sortedAsks[i] < ob.sortedAsks[j]
 	})
+
+	if cap(ob.askLevels) >= n {
+		ob.askLevels = ob.askLevels[:n]
+	} else {
+		ob.askLevels = make([]BookLevel, n)
+	}
+	for i, pk := range ob.sortedAsks {
+		ob.askLevels[i] = BookLevel{Price: ToFloat(pk), Size: ob.asks[pk]}
+	}
 
 	ob.askBest = ob.sortedAsks[0]
 	ob.totalAskDepth = total
