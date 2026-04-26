@@ -466,12 +466,42 @@ func (c *Client) PostOrders(ctx context.Context, orders []PostOrderArg) ([]PostO
 	return result, nil
 }
 
-func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) error {
-	_, err := c.doDelete(ctx, EndpointCancelOrders, orderIDs)
-	return err
+// CancelOrders sends DELETE /orders with the given IDs and returns the
+// per-ID outcome. Callers MUST inspect the response: the matcher accepts
+// the request even when some IDs cannot be cancelled (already filled,
+// already cancelled, owner mismatch, etc.), so a nil error does not
+// mean "all cancelled" — only IDs in resp.Canceled were actually
+// removed. Local state (LiveOrders, partitioner reservations) must be
+// updated using resp.Canceled, not the input IDs, to avoid drift.
+func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) (*CancelResponse, error) {
+	raw, err := c.doDelete(ctx, EndpointCancelOrders, orderIDs)
+	if err != nil {
+		return nil, err
+	}
+	var result CancelResponse
+	if len(raw) == 0 {
+		return &result, nil
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse cancel_orders response: %w", err)
+	}
+	return &result, nil
 }
 
-func (c *Client) CancelAll(ctx context.Context) error {
-	_, err := c.doDelete(ctx, EndpointCancelAll, nil)
-	return err
+// CancelAll sends DELETE /cancel-all and returns the per-ID outcome
+// for every order the server held for this account. Same caller
+// contract as CancelOrders: only resp.Canceled is authoritative.
+func (c *Client) CancelAll(ctx context.Context) (*CancelResponse, error) {
+	raw, err := c.doDelete(ctx, EndpointCancelAll, nil)
+	if err != nil {
+		return nil, err
+	}
+	var result CancelResponse
+	if len(raw) == 0 {
+		return &result, nil
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse cancel_all response: %w", err)
+	}
+	return &result, nil
 }

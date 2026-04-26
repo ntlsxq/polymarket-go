@@ -114,6 +114,19 @@ type PostOrderResponse struct {
 	ErrorMsg           string   `json:"errorMsg,omitempty"`
 }
 
+// CancelResponse is the wire shape returned by DELETE /orders and
+// DELETE /cancel-all. Canceled lists the order IDs the matcher actually
+// removed; NotCanceled maps each rejected order ID to a reason
+// (e.g. "order not found", "owner mismatch"). Both endpoints share the
+// same response shape, so callers can reuse this for either.
+//
+// Asymmetry is deliberate on the wire: Canceled is a flat array, NotCanceled
+// is an id→reason map. Empty NotCanceled (={}) is the all-success case.
+type CancelResponse struct {
+	Canceled    []string          `json:"canceled"`
+	NotCanceled map[string]string `json:"not_canceled"`
+}
+
 // BalanceAllowance is GET /balance-allowance response.
 // Polymarket serves two shapes depending on API version: older { balance, allowance }
 // (both strings in USDC 6-decimal units) and newer { balance, allowances: {addr: ""} }.

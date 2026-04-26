@@ -61,6 +61,45 @@ func TestPostOrderResponseUnmarshal(t *testing.T) {
 	}
 }
 
+func TestCancelResponseUnmarshal(t *testing.T) {
+	t.Run("partial_failure", func(t *testing.T) {
+		raw := []byte(`{
+			"canceled": ["0xa1", "0xa2"],
+			"not_canceled": {"0xb1": "order not found", "0xb2": "owner mismatch"}
+		}`)
+		var r CancelResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(r.Canceled) != 2 || r.Canceled[0] != "0xa1" {
+			t.Fatalf("canceled wrong: %+v", r.Canceled)
+		}
+		if len(r.NotCanceled) != 2 || r.NotCanceled["0xb1"] != "order not found" {
+			t.Fatalf("not_canceled wrong: %+v", r.NotCanceled)
+		}
+	})
+	t.Run("all_success_empty_map", func(t *testing.T) {
+		raw := []byte(`{"canceled":["0x1"],"not_canceled":{}}`)
+		var r CancelResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(r.Canceled) != 1 || len(r.NotCanceled) != 0 {
+			t.Fatalf("unexpected: %+v", r)
+		}
+	})
+	t.Run("nothing_to_cancel", func(t *testing.T) {
+		raw := []byte(`{"canceled":[],"not_canceled":{}}`)
+		var r CancelResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(r.Canceled) != 0 || len(r.NotCanceled) != 0 {
+			t.Fatalf("unexpected: %+v", r)
+		}
+	})
+}
+
 func TestBalanceAllowanceUnmarshalBothShapes(t *testing.T) {
 	legacy := []byte(`{"balance":"1500.000000","allowance":"1500.000000"}`)
 	var a BalanceAllowance
