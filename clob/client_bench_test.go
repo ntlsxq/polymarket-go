@@ -60,7 +60,7 @@ func BenchmarkBuildOrderEnd2End(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err := c.BuildOrder(ctx, tokenID, 0.55, 100,
 			WithBuy(),
-			WithMarket("0.01", false, 0),
+			WithMarket("0.01", false),
 			AsGTC(),
 		)
 		if err != nil {
@@ -79,7 +79,7 @@ func BenchmarkBuildOrderWithFeeAdjust(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err := c.BuildOrder(ctx, tokenID, 0.55, 100,
 			WithBuy(),
-			WithMarket("0.01", false, 0),
+			WithMarket("0.01", false),
 			AsFOK(),
 			WithFeeAdjustment(0.072, "0.01", 0.55),
 		)

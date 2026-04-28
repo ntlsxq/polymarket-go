@@ -22,8 +22,8 @@ func BenchmarkEncodePackedSmall(b *testing.B) {
 	}
 }
 
-// BenchmarkEncodePackedLarge approximates the order-struct shape: type-hash +
-// 12 × 32-byte fields = 13 parts. Pin the alloc count we'd save with a
+// BenchmarkEncodePackedLarge approximates the legacy order-struct shape:
+// type-hash + 12 × 32-byte fields = 13 parts. Pin the alloc count we'd save with a
 // fixed-size buffer.
 func BenchmarkEncodePackedLarge(b *testing.B) {
 	parts := make([][]byte, 13)
@@ -55,7 +55,7 @@ func BenchmarkBuildClobAuthDomainSeparator(b *testing.B) {
 }
 
 func BenchmarkBuildCTFDomainSeparator(b *testing.B) {
-	addr := common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+	addr := common.HexToAddress("0xE111180000d2663C0091e4f400237545B87B996B")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

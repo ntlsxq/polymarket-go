@@ -1,8 +1,11 @@
 package clob
 
 import (
+	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/goccy/go-json"
 )
 
@@ -58,6 +61,75 @@ func TestPostOrderResponseUnmarshal(t *testing.T) {
 	}
 	if len(r.TransactionsHashes) != 1 || len(r.TradeIDs) != 1 {
 		t.Fatalf("arrays not parsed: %+v", r)
+	}
+}
+
+func TestSignedOrderMarshalV2WireShape(t *testing.T) {
+	tokenID, _ := new(big.Int).SetString("71321045679252212594626385532706912750332728571942532289631379312455583992563", 10)
+	so := &SignedOrder{
+		Order: OrderData{
+			Salt:          big.NewInt(12345),
+			Maker:         common.HexToAddress("0x1111111111111111111111111111111111111111"),
+			Signer:        common.HexToAddress("0x2222222222222222222222222222222222222222"),
+			TokenID:       tokenID,
+			MakerAmount:   big.NewInt(1_000_000),
+			TakerAmount:   big.NewInt(2_000_000),
+			Side:          SideBuyInt,
+			SignatureType: 1,
+			Timestamp:     big.NewInt(1713398400000),
+		},
+		Signature: "0xsig",
+	}
+
+	wire := so.Marshal()
+	if wire.Expiration != "0" || wire.Timestamp != "1713398400000" {
+		t.Fatalf("unexpected v2 timing fields: %+v", wire)
+	}
+	if wire.Metadata != "0x0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("metadata must marshal as bytes32 hex: %q", wire.Metadata)
+	}
+	if wire.Builder != "0x0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("builder must marshal as bytes32 hex: %q", wire.Builder)
+	}
+
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire: %v", err)
+	}
+	body := string(raw)
+	for _, gone := range []string{"taker", "nonce", "feeRateBps"} {
+		if strings.Contains(body, `"`+gone+`":`) {
+			t.Fatalf("v1 field %q must not be in v2 order body: %s", gone, body)
+		}
+	}
+	for _, want := range []string{"expiration", "timestamp", "metadata", "builder"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing v2 wire field %q in %s", want, body)
+		}
+	}
+}
+
+func TestContractConfigV2Mainnet(t *testing.T) {
+	cfg, ok := GetContractConfig(137, false)
+	if !ok {
+		t.Fatal("missing mainnet contract config")
+	}
+	if cfg.Exchange != common.HexToAddress("0xE111180000d2663C0091e4f400237545B87B996B") {
+		t.Fatalf("wrong v2 exchange: %s", cfg.Exchange.Hex())
+	}
+	if cfg.Collateral != common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB") {
+		t.Fatalf("wrong pUSD collateral: %s", cfg.Collateral.Hex())
+	}
+
+	neg, ok := GetContractConfig(137, true)
+	if !ok {
+		t.Fatal("missing mainnet neg-risk contract config")
+	}
+	if neg.Exchange != common.HexToAddress("0xe2222d279d744050d28e00520010520000310F59") {
+		t.Fatalf("wrong v2 neg-risk exchange: %s", neg.Exchange.Hex())
+	}
+	if neg.Collateral != cfg.Collateral {
+		t.Fatalf("neg-risk collateral mismatch: %s != %s", neg.Collateral.Hex(), cfg.Collateral.Hex())
 	}
 }
 

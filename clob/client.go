@@ -186,18 +186,20 @@ func (c *Client) doDelete(ctx context.Context, path string, body any) (json.RawM
 type OrderOption func(*orderOpts)
 
 type orderOpts struct {
-	id                 string
-	side               string
-	tickSize           string
-	negRisk            bool
-	feeRateBps         int64
-	orderType          string
-	postOnly           bool
-	deferExec          bool
-	feeAdjust          bool
-	feeAdjustRate      float64
-	feeAdjustTickSize  string
-	feeAdjustRefPrice  float64
+	id                string
+	side              string
+	tickSize          string
+	negRisk           bool
+	orderType         string
+	postOnly          bool
+	deferExec         bool
+	feeAdjust         bool
+	feeAdjustRate     float64
+	feeAdjustTickSize string
+	feeAdjustRefPrice float64
+	expiration        *big.Int
+	builder           [32]byte
+	metadata          [32]byte
 }
 
 func WithID(id string) OrderOption {
@@ -207,16 +209,30 @@ func WithID(id string) OrderOption {
 func WithBuy() OrderOption  { return func(o *orderOpts) { o.side = SideBuy } }
 func WithSell() OrderOption { return func(o *orderOpts) { o.side = SideSell } }
 
-func WithMarket(tickSize string, negRisk bool, feeRateBps int64) OrderOption {
+func WithMarket(tickSize string, negRisk bool) OrderOption {
 	return func(o *orderOpts) {
 		o.tickSize = tickSize
 		o.negRisk = negRisk
-		o.feeRateBps = feeRateBps
 	}
 }
 
-func AsGTC() OrderOption       { return func(o *orderOpts) { o.orderType = "GTC" } }
-func AsFOK() OrderOption       { return func(o *orderOpts) { o.orderType = "FOK" } }
+func WithBuilder(builderCode [32]byte) OrderOption {
+	return func(o *orderOpts) { o.builder = builderCode }
+}
+
+func WithMetadata(metadata [32]byte) OrderOption {
+	return func(o *orderOpts) { o.metadata = metadata }
+}
+
+func AsGTC() OrderOption { return func(o *orderOpts) { o.orderType = OrderTypeGTC } }
+func AsFOK() OrderOption { return func(o *orderOpts) { o.orderType = OrderTypeFOK } }
+func AsFAK() OrderOption { return func(o *orderOpts) { o.orderType = OrderTypeFAK } }
+func AsGTD(expiration int64) OrderOption {
+	return func(o *orderOpts) {
+		o.orderType = OrderTypeGTD
+		o.expiration = big.NewInt(expiration)
+	}
+}
 func AsPostOnly() OrderOption  { return func(o *orderOpts) { o.postOnly = true } }
 func AsDeferExec() OrderOption { return func(o *orderOpts) { o.deferExec = true } }
 
@@ -230,9 +246,9 @@ func AsDeferExec() OrderOption { return func(o *orderOpts) { o.deferExec = true 
 // limit price — fee oversizing must track where the fill actually happens.
 // Pass 0 to fall back to the order's limit price (useful when limit == ask).
 //
-// feeRate is the schedule rate as a fraction (e.g. 0.072 for crypto_fees_v2),
-// not the on-chain advisory FeeRateBps. The generic post-adjust validations
-// (tick alignment, MinBuyShares) run unconditionally on every BuildOrder call.
+// feeRate is the schedule rate as a fraction (e.g. 0.072 for crypto_fees_v2).
+// The generic post-adjust validations (tick alignment, MinBuyShares) run
+// unconditionally on every BuildOrder call.
 func WithFeeAdjustment(feeRate float64, tickSize string, refPrice float64) OrderOption {
 	return func(o *orderOpts) {
 		o.feeAdjust = true
@@ -263,7 +279,7 @@ func BuyFeeRate(price, rate float64) float64 {
 }
 
 // BuildOrder signs an order and returns a PostOrderArg ready for PostOrders.
-// Required options: WithBuy/WithSell, WithMarket, AsGTC/AsFOK.
+// Required options: WithBuy/WithSell, WithMarket, and one order type option.
 func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size float64, opts ...OrderOption) (PostOrderArg, error) {
 	_ = ctx
 	var oo orderOpts
@@ -323,15 +339,14 @@ func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size flo
 		Salt:          salt,
 		Maker:         c.funder,
 		Signer:        c.address,
-		Taker:         ZeroAddress,
 		TokenID:       tokenIDBig,
 		MakerAmount:   big.NewInt(makerAmt),
 		TakerAmount:   big.NewInt(takerAmt),
-		Expiration:    big.NewInt(0),
-		Nonce:         big.NewInt(0),
-		FeeRateBps:    big.NewInt(oo.feeRateBps),
 		Side:          orderSide,
 		SignatureType: c.sigType,
+		Timestamp:     big.NewInt(time.Now().UnixMilli()),
+		Metadata:      oo.metadata,
+		Builder:       oo.builder,
 	}
 
 	sig, err := SignOrder(c.privKey, c.chainID, order, oo.negRisk)
@@ -339,8 +354,13 @@ func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size flo
 		return PostOrderArg{}, fmt.Errorf("sign order: %w", err)
 	}
 
+	expiration := oo.expiration
+	if expiration == nil {
+		expiration = big.NewInt(0)
+	}
+
 	return PostOrderArg{
-		Order:     &SignedOrder{Order: order, Signature: sig},
+		Order:     &SignedOrder{Order: order, Expiration: expiration, Signature: sig},
 		OrderType: oo.orderType,
 		PostOnly:  oo.postOnly,
 		DeferExec: oo.deferExec,

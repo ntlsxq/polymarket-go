@@ -15,15 +15,14 @@ func fixtureOrder(salt int64) OrderData {
 		Salt:          big.NewInt(salt),
 		Maker:         common.HexToAddress("0x1111111111111111111111111111111111111111"),
 		Signer:        common.HexToAddress("0x2222222222222222222222222222222222222222"),
-		Taker:         ZeroAddress,
 		TokenID:       tokenID,
 		MakerAmount:   big.NewInt(5_000_000),
 		TakerAmount:   big.NewInt(2_500_000),
-		Expiration:    big.NewInt(0),
-		Nonce:         big.NewInt(0),
-		FeeRateBps:    big.NewInt(0),
 		Side:          SideSellInt,
 		SignatureType: 0,
+		Timestamp:     big.NewInt(1700000000000),
+		Metadata:      [32]byte{},
+		Builder:       [32]byte{},
 	}
 }
 

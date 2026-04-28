@@ -175,8 +175,8 @@ type ContractConfig struct {
 
 var contractConfigs = map[int]ContractConfig{
 	137: {
-		Exchange:          common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
-		Collateral:        common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+		Exchange:          common.HexToAddress("0xE111180000d2663C0091e4f400237545B87B996B"),
+		Collateral:        common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
 		ConditionalTokens: common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
 	},
 	80002: {
@@ -188,8 +188,8 @@ var contractConfigs = map[int]ContractConfig{
 
 var negRiskConfigs = map[int]ContractConfig{
 	137: {
-		Exchange:          common.HexToAddress("0xC5d563A36AE78145C45a50134d48A1215220f80a"),
-		Collateral:        common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+		Exchange:          common.HexToAddress("0xe2222d279d744050d28e00520010520000310F59"),
+		Collateral:        common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
 		ConditionalTokens: common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
 	},
 	80002: {
@@ -227,20 +227,22 @@ type OrderData struct {
 	Salt          *big.Int
 	Maker         common.Address
 	Signer        common.Address
-	Taker         common.Address
 	TokenID       *big.Int
 	MakerAmount   *big.Int
 	TakerAmount   *big.Int
-	Expiration    *big.Int
-	Nonce         *big.Int
-	FeeRateBps    *big.Int
 	Side          int
 	SignatureType int
+	Timestamp     *big.Int
+	Metadata      [32]byte
+	Builder       [32]byte
 }
 
 type SignedOrder struct {
-	Order     OrderData
-	Signature string
+	Order OrderData
+	// Expiration is a POST /order wire field for GTD handling. It is not part
+	// of the CLOB V2 EIP-712 signed order.
+	Expiration *big.Int
+	Signature  string
 }
 
 // SignedOrderJSON is the wire shape of a signed order accepted by the CLOB
@@ -251,15 +253,15 @@ type SignedOrderJSON struct {
 	Salt          *big.Int `json:"salt"`
 	Maker         string   `json:"maker"`
 	Signer        string   `json:"signer"`
-	Taker         string   `json:"taker"`
 	TokenID       string   `json:"tokenId"`
 	MakerAmount   string   `json:"makerAmount"`
 	TakerAmount   string   `json:"takerAmount"`
-	Expiration    string   `json:"expiration"`
-	Nonce         string   `json:"nonce"`
-	FeeRateBps    string   `json:"feeRateBps"`
 	Side          string   `json:"side"`
+	Expiration    string   `json:"expiration"`
 	SignatureType int      `json:"signatureType"`
+	Timestamp     string   `json:"timestamp"`
+	Metadata      string   `json:"metadata"`
+	Builder       string   `json:"builder"`
 	Signature     string   `json:"signature"`
 }
 
@@ -272,17 +274,24 @@ func (so *SignedOrder) Marshal() SignedOrderJSON {
 		Salt:          so.Order.Salt,
 		Maker:         so.Order.Maker.Hex(),
 		Signer:        so.Order.Signer.Hex(),
-		Taker:         so.Order.Taker.Hex(),
 		TokenID:       so.Order.TokenID.String(),
 		MakerAmount:   so.Order.MakerAmount.String(),
 		TakerAmount:   so.Order.TakerAmount.String(),
-		Expiration:    so.Order.Expiration.String(),
-		Nonce:         so.Order.Nonce.String(),
-		FeeRateBps:    so.Order.FeeRateBps.String(),
 		Side:          side,
+		Expiration:    signedOrderExpiration(so.Expiration),
 		SignatureType: so.Order.SignatureType,
+		Timestamp:     so.Order.Timestamp.String(),
+		Metadata:      "0x" + common.Bytes2Hex(so.Order.Metadata[:]),
+		Builder:       "0x" + common.Bytes2Hex(so.Order.Builder[:]),
 		Signature:     so.Signature,
 	}
+}
+
+func signedOrderExpiration(expiration *big.Int) string {
+	if expiration == nil {
+		return "0"
+	}
+	return expiration.String()
 }
 
 type PostOrderArg struct {

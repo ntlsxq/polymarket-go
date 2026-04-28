@@ -17,9 +17,9 @@ type tickSizeResponse struct {
 	TickSize        flexString `json:"tick_size"`
 }
 
-// GetFeeRate fetches the CLOB base_fee (signed-order FeeRateBps, distinct
-// from the strategy fee coefficient on Market.FeeRate). Called at bootstrap
-// to populate Market.FeeRateBps; not on hot paths.
+// GetFeeRate fetches the CLOB base_fee for informational purposes. In V2,
+// fees are determined at match time by the protocol, not embedded in orders.
+// This endpoint can be used to display expected fees to users or for analytics.
 func (c *Client) GetFeeRate(ctx context.Context, tokenID string) (int64, error) {
 	path := EndpointGetFeeRate + "?token_id=" + tokenID
 	raw, err := c.doGet(ctx, path)

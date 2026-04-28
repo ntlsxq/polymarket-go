@@ -59,6 +59,7 @@ func encodeString(s string) []byte {
 const (
 	clobDomainName = "ClobAuthDomain"
 	clobVersion    = "1"
+	ctfVersion     = "2"
 	msgToSign      = "This message attests that I control the given wallet"
 )
 
@@ -67,7 +68,7 @@ const (
 // 5–6 keccak256 invocations + the corresponding allocs per signed order.
 var (
 	clobAuthTypeHash         = keccak256([]byte("ClobAuth(address address,string timestamp,uint256 nonce,string message)"))
-	orderTypeHash            = keccak256([]byte("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"))
+	orderTypeHash            = keccak256([]byte("Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)"))
 	eip712DomainTypeHashClob = keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId)"))
 	eip712DomainTypeHashCTF  = keccak256([]byte("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"))
 
@@ -75,7 +76,7 @@ var (
 	keccakClobVersion    = keccak256([]byte(clobVersion))
 	keccakMsgToSign      = keccak256([]byte(msgToSign))
 	keccakCTFName        = keccak256([]byte("Polymarket CTF Exchange"))
-	keccakOne            = keccak256([]byte("1"))
+	keccakCTFVersion     = keccak256([]byte(ctfVersion))
 )
 
 // writeUint256 writes v as a 32-byte big-endian uint256 into dst[0:32].
@@ -247,27 +248,26 @@ func buildCTFDomainSeparator(chainID int, exchangeAddr common.Address) []byte {
 	var buf [5 * 32]byte
 	copy(buf[0:32], eip712DomainTypeHashCTF)
 	copy(buf[32:64], keccakCTFName)
-	copy(buf[64:96], keccakOne)
+	copy(buf[64:96], keccakCTFVersion)
 	writeUint256(buf[96:128], big.NewInt(int64(chainID)))
 	writeAddress(buf[128:160], exchangeAddr)
 	return keccak256(buf[:])
 }
 
 func buildOrderStructHash(order OrderData) []byte {
-	var buf [13 * 32]byte
+	var buf [12 * 32]byte
 	copy(buf[0:32], orderTypeHash)
 	writeUint256(buf[32:64], order.Salt)
 	writeAddress(buf[64:96], order.Maker)
 	writeAddress(buf[96:128], order.Signer)
-	writeAddress(buf[128:160], order.Taker)
-	writeUint256(buf[160:192], order.TokenID)
-	writeUint256(buf[192:224], order.MakerAmount)
-	writeUint256(buf[224:256], order.TakerAmount)
-	writeUint256(buf[256:288], order.Expiration)
-	writeUint256(buf[288:320], order.Nonce)
-	writeUint256(buf[320:352], order.FeeRateBps)
-	writeUint8(buf[352:384], order.Side)
-	writeUint8(buf[384:416], order.SignatureType)
+	writeUint256(buf[128:160], order.TokenID)
+	writeUint256(buf[160:192], order.MakerAmount)
+	writeUint256(buf[192:224], order.TakerAmount)
+	writeUint8(buf[224:256], order.Side)
+	writeUint8(buf[256:288], order.SignatureType)
+	writeUint256(buf[288:320], order.Timestamp)
+	copy(buf[320:352], order.Metadata[:])
+	copy(buf[352:384], order.Builder[:])
 	return keccak256(buf[:])
 }
 

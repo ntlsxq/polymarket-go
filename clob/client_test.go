@@ -1,6 +1,7 @@
 package clob
 
 import (
+	"context"
 	"testing"
 )
 
@@ -42,8 +43,9 @@ func TestComputeOrderAmountsParity(t *testing.T) {
 
 // TestComputeOrderAmountsBuyShape pins the symbolic identity:
 // for BUY at size=10, price=0.55, tick=0.01:
-//   maker (USDC, 6dec) = 10 × 0.55 × 1_000_000 = 5_500_000
-//   taker (CTF,  6dec) = 10        × 1_000_000 = 10_000_000
+//
+//	maker (USDC, 6dec) = 10 × 0.55 × 1_000_000 = 5_500_000
+//	taker (CTF,  6dec) = 10        × 1_000_000 = 10_000_000
 func TestComputeOrderAmountsBuyShape(t *testing.T) {
 	rc := RoundingConfigs["0.01"]
 	side, maker, taker := computeOrderAmounts(SideBuy, 10, 0.55, rc)
@@ -58,6 +60,31 @@ func TestComputeOrderAmountsSellShape(t *testing.T) {
 	// SELL: maker = shares, taker = USDC
 	if side != SideSellInt || maker != 10_000_000 || taker != 5_500_000 {
 		t.Fatalf("SELL 10@0.55: side=%d maker=%d taker=%d", side, maker, taker)
+	}
+}
+
+func TestBuildOrderCarriesGTDExpirationOutsideSignature(t *testing.T) {
+	c, err := NewClient(ClobHost, "0101010101010101010101010101010101010101010101010101010101010101", 137, 0, "")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	arg, err := c.BuildOrder(context.Background(), "71321045679252212594626385532706912750332728571942532289631379312455583992563", 0.55, 10,
+		WithBuy(),
+		WithMarket("0.01", false),
+		AsGTD(1714000000),
+	)
+	if err != nil {
+		t.Fatalf("build order: %v", err)
+	}
+	if arg.OrderType != OrderTypeGTD {
+		t.Fatalf("order type = %q, want GTD", arg.OrderType)
+	}
+	if arg.Order.Expiration == nil || arg.Order.Expiration.String() != "1714000000" {
+		t.Fatalf("expiration = %v, want 1714000000", arg.Order.Expiration)
+	}
+	if got := arg.Order.Marshal().Expiration; got != "1714000000" {
+		t.Fatalf("wire expiration = %q, want 1714000000", got)
 	}
 }
 
