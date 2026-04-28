@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -18,16 +19,23 @@ import (
 )
 
 const (
-	CTFAddr                = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-	NegRiskCTFAddr         = "0xd91e80cF2E7be2e162c6513ceD06f1dD0dA35296"
-	PUSDAddr               = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-	GSNRelayHub            = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
-	ProxyWalletFactoryAddr = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
-	ProxyInitCodeHash      = "d21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
-	PUSDDecimals           = 6
+	CTFAddr                         = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+	NegRiskAdapterAddr              = "0xd91e80cF2E7be2e162c6513ceD06f1dD0dA35296"
+	NegRiskCTFAddr                  = NegRiskAdapterAddr
+	CtfCollateralAdapterAddr        = "0xADa100874d00e3331D00F2007a9c336a65009718"
+	NegRiskCtfCollateralAdapterAddr = "0xAdA200001000ef00D07553cEE7006808F895c6F1"
+	PUSDAddr                        = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+	GSNRelayHub                     = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
+	ProxyWalletFactoryAddr          = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+	ProxyInitCodeHash               = "d21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+	PUSDDecimals                    = 6
 )
 
 const (
+	// gasSlack is a flat buffer added to eth_estimateGas output to absorb
+	// cold/warm slot drift between simulation and relayed execution.
+	gasSlack = 30_000
+
 	// Polymarket's relayer submits RelayHub transactions with a 10M outer gas
 	// limit. RelayHub's guard requires signedGasLimit + 350k reserve to fit
 	// after tx intrinsic/calldata gas and the pre-guard execution cost.
@@ -46,7 +54,8 @@ const ctfABIJSON = `[
 	{"name":"splitPosition","type":"function","inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"partition","type":"uint256[]"},{"name":"amount","type":"uint256"}],"outputs":[]},
 	{"name":"mergePositions","type":"function","inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"partition","type":"uint256[]"},{"name":"amount","type":"uint256"}],"outputs":[]},
 	{"name":"redeemPositions","type":"function","inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"outputs":[]},
-	{"name":"setApprovalForAll","type":"function","inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"outputs":[]}
+	{"name":"setApprovalForAll","type":"function","inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"outputs":[]},
+	{"name":"isApprovedForAll","type":"function","inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"outputs":[{"name":"","type":"bool"}]}
 ]`
 
 const negRiskABIJSON = `[
@@ -54,7 +63,8 @@ const negRiskABIJSON = `[
 ]`
 
 const erc20ApproveABIJSON = `[
-	{"name":"approve","type":"function","inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"name":"","type":"bool"}]}
+	{"name":"approve","type":"function","inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"name":"","type":"bool"}]},
+	{"name":"allowance","type":"function","inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"outputs":[{"name":"","type":"uint256"}]}
 ]`
 
 const proxyWalletFactoryABIJSON = `[
@@ -111,18 +121,20 @@ type TxResult struct {
 }
 
 type OnChainClient struct {
-	relayerClient  *http.Client
-	eth            *ethclient.Client
-	privKey        *ecdsa.PrivateKey
-	fromAddr       common.Address
-	factoryAddr    common.Address
-	ctfAddr        common.Address
-	negRiskCTFAddr common.Address
-	collateralAddr common.Address
-	relayHub       common.Address
-	relayerAPIKey  string
-	approvedMu     sync.Mutex
-	approved       map[common.Address]bool
+	relayerClient                *http.Client
+	eth                          *ethclient.Client
+	privKey                      *ecdsa.PrivateKey
+	fromAddr                     common.Address
+	factoryAddr                  common.Address
+	ctfAddr                      common.Address
+	ctfCollateralAdapterAddr     common.Address
+	negRiskCTFAddr               common.Address
+	negRiskCollateralAdapterAddr common.Address
+	collateralAddr               common.Address
+	relayHub                     common.Address
+	relayerAPIKey                string
+	approvedMu                   sync.Mutex
+	approved                     map[common.Address]bool
 }
 
 type OnChainConfig struct {
@@ -154,16 +166,18 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 		relayerClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		eth:            eth,
-		privKey:        cfg.PrivateKey,
-		fromAddr:       fromAddr,
-		factoryAddr:    common.HexToAddress(ProxyWalletFactoryAddr),
-		ctfAddr:        common.HexToAddress(CTFAddr),
-		negRiskCTFAddr: common.HexToAddress(NegRiskCTFAddr),
-		collateralAddr: common.HexToAddress(PUSDAddr),
-		relayHub:       common.HexToAddress(GSNRelayHub),
-		relayerAPIKey:  cfg.RelayerAPIKey,
-		approved:       make(map[common.Address]bool),
+		eth:                          eth,
+		privKey:                      cfg.PrivateKey,
+		fromAddr:                     fromAddr,
+		factoryAddr:                  common.HexToAddress(ProxyWalletFactoryAddr),
+		ctfAddr:                      common.HexToAddress(CTFAddr),
+		ctfCollateralAdapterAddr:     common.HexToAddress(CtfCollateralAdapterAddr),
+		negRiskCTFAddr:               common.HexToAddress(NegRiskCTFAddr),
+		negRiskCollateralAdapterAddr: common.HexToAddress(NegRiskCtfCollateralAdapterAddr),
+		collateralAddr:               common.HexToAddress(PUSDAddr),
+		relayHub:                     common.HexToAddress(GSNRelayHub),
+		relayerAPIKey:                cfg.RelayerAPIKey,
+		approved:                     make(map[common.Address]bool),
 	}, nil
 }
 
@@ -171,6 +185,16 @@ func (oc *OnChainClient) Close() {
 	if oc.eth != nil {
 		oc.eth.Close()
 	}
+}
+
+func (oc *OnChainClient) estimateProxyGas(ctx context.Context, encodedFunction []byte) (uint64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return oc.eth.EstimateGas(ctx, ethereum.CallMsg{
+		From: oc.fromAddr,
+		To:   &oc.factoryAddr,
+		Data: encodedFunction,
+	})
 }
 
 func (oc *OnChainClient) SplitPosition(ctx context.Context, conditionId string, amount int, negRisk bool) (string, error) {
@@ -207,7 +231,7 @@ func (oc *OnChainClient) packSplitMerge(method, conditionId string, amount int, 
 
 	target := oc.ctfAddr
 	if negRisk {
-		target = oc.negRiskCTFAddr
+		target = oc.negRiskCollateralAdapterAddr
 	}
 	calldata, err := ctfABI.Pack(method, oc.collateralAddr, parentCollectionIDZero, condID, BinaryPartition, amountBig)
 	return target, calldata, err
@@ -219,7 +243,7 @@ func (oc *OnChainClient) packConvert(marketId string, indexSet int, amount int) 
 	copy(mID[32-len(mBytes):], mBytes)
 
 	calldata, err := negRiskABI.Pack("convertPositions", mID, big.NewInt(int64(indexSet)), big.NewInt(int64(amount)))
-	return oc.negRiskCTFAddr, calldata, err
+	return oc.negRiskCollateralAdapterAddr, calldata, err
 }
 
 func (oc *OnChainClient) packRedeem(conditionId string) (common.Address, []byte, error) {
@@ -304,7 +328,7 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 	}
 	spender := b.oc.ctfAddr
 	if negRisk {
-		spender = b.oc.negRiskCTFAddr
+		spender = b.oc.negRiskCollateralAdapterAddr
 	}
 	maxUint256 := new(big.Int)
 	maxUint256.SetString(maxUint256Hex, 16)
@@ -316,7 +340,7 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 	b.ops = append(b.ops, txOp{b.oc.collateralAddr, calldata})
 
 	if negRisk {
-		cd, err := ctfABI.Pack("setApprovalForAll", b.oc.negRiskCTFAddr, true)
+		cd, err := ctfABI.Pack("setApprovalForAll", b.oc.negRiskCollateralAdapterAddr, true)
 		if err != nil {
 			b.err = err
 			return b
@@ -373,7 +397,99 @@ func (oc *OnChainClient) EnsureApproval(ctx context.Context, spender common.Addr
 
 func (oc *OnChainClient) EnsureApprovalForSplit(ctx context.Context, negRisk bool) (string, error) {
 	if negRisk {
-		return oc.EnsureApproval(ctx, oc.negRiskCTFAddr)
+		return oc.EnsureApproval(ctx, oc.negRiskCollateralAdapterAddr)
 	}
 	return oc.EnsureApproval(ctx, oc.ctfAddr)
+}
+
+type ApprovalState struct {
+	ProxyWallet                common.Address
+	StandardCollateralApproved bool
+	NegRiskCollateralApproved  bool
+	NegRiskCTFApproved         bool
+}
+
+func (s ApprovalState) StandardReady() bool {
+	return s.StandardCollateralApproved
+}
+
+func (s ApprovalState) NegRiskReady() bool {
+	return s.NegRiskCollateralApproved && s.NegRiskCTFApproved
+}
+
+func (oc *OnChainClient) CheckApprovals(ctx context.Context) (ApprovalState, error) {
+	proxyWallet := deriveProxyWallet(oc.fromAddr)
+	standard, err := oc.hasMaxCollateralAllowance(ctx, proxyWallet, oc.ctfAddr)
+	if err != nil {
+		return ApprovalState{}, fmt.Errorf("check standard collateral allowance: %w", err)
+	}
+	negCollateral, err := oc.hasMaxCollateralAllowance(ctx, proxyWallet, oc.negRiskCollateralAdapterAddr)
+	if err != nil {
+		return ApprovalState{}, fmt.Errorf("check neg-risk collateral allowance: %w", err)
+	}
+	negCTF, err := oc.hasCTFApprovalForAll(ctx, proxyWallet, oc.negRiskCollateralAdapterAddr)
+	if err != nil {
+		return ApprovalState{}, fmt.Errorf("check neg-risk ctf approval: %w", err)
+	}
+	return ApprovalState{
+		ProxyWallet:                proxyWallet,
+		StandardCollateralApproved: standard,
+		NegRiskCollateralApproved:  negCollateral,
+		NegRiskCTFApproved:         negCTF,
+	}, nil
+}
+
+func (oc *OnChainClient) hasMaxCollateralAllowance(ctx context.Context, owner, spender common.Address) (bool, error) {
+	out, err := oc.callContract(ctx, oc.collateralAddr, erc20ApproveABI, "allowance", owner, spender)
+	if err != nil {
+		return false, err
+	}
+	if len(out) != 1 {
+		return false, fmt.Errorf("unexpected allowance outputs: %d", len(out))
+	}
+	allowance, ok := out[0].(*big.Int)
+	if !ok {
+		return false, fmt.Errorf("unexpected allowance type %T", out[0])
+	}
+	return allowance.Cmp(maxApprovalThreshold()) >= 0, nil
+}
+
+func (oc *OnChainClient) hasCTFApprovalForAll(ctx context.Context, owner, operator common.Address) (bool, error) {
+	out, err := oc.callContract(ctx, oc.ctfAddr, ctfABI, "isApprovedForAll", owner, operator)
+	if err != nil {
+		return false, err
+	}
+	if len(out) != 1 {
+		return false, fmt.Errorf("unexpected isApprovedForAll outputs: %d", len(out))
+	}
+	approved, ok := out[0].(bool)
+	if !ok {
+		return false, fmt.Errorf("unexpected isApprovedForAll type %T", out[0])
+	}
+	return approved, nil
+}
+
+func (oc *OnChainClient) callContract(ctx context.Context, target common.Address, contractABI abi.ABI, method string, args ...interface{}) ([]interface{}, error) {
+	data, err := contractABI.Pack(method, args...)
+	if err != nil {
+		return nil, fmt.Errorf("pack %s: %w", method, err)
+	}
+	raw, err := oc.eth.CallContract(ctx, ethereum.CallMsg{
+		To:   &target,
+		Data: data,
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("call %s: %w", method, err)
+	}
+	out, err := contractABI.Unpack(method, raw)
+	if err != nil {
+		return nil, fmt.Errorf("unpack %s: %w", method, err)
+	}
+	return out, nil
+}
+
+func maxApprovalThreshold() *big.Int {
+	maxUint256 := new(big.Int)
+	maxUint256.SetString(maxUint256Hex, 16)
+	return maxUint256.Rsh(maxUint256, 1)
 }

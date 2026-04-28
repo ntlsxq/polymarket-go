@@ -182,15 +182,33 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 
 	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")
 
-	gasLimit, sigBytes, relayCallGas, err := oc.signMaxGuardRelay(encodedFunction, relayAddr, nonceBig)
+	est, err := oc.estimateProxyGas(ctx, encodedFunction)
+	if err != nil {
+		return "", fmt.Errorf("estimate proxy gas: %w", err)
+	}
+	gasLimit := est + gasSlack
+	sigBytes, err := oc.signProxyRelay(encodedFunction, gasLimit, relayAddr, nonceBig)
+	if err != nil {
+		return "", fmt.Errorf("sign: %w", err)
+	}
+	relayCallData, err := oc.packRelayCall(encodedFunction, gasLimit, relayAddr, nonceBig, sigBytes)
 	if err != nil {
 		return "", err
 	}
+	maxGas, relayCallGas, err := maxGuardRelayGasLimit(relayCallData)
+	if err != nil {
+		return "", err
+	}
+	if gasLimit > maxGas {
+		return "", fmt.Errorf("estimated relay gas %d exceeds RelayHub guard max %d", gasLimit, maxGas)
+	}
 	log.Debug().
+		Uint64("estimate", est).
 		Uint64("gasLimit", gasLimit).
+		Uint64("guardMax", maxGas).
 		Uint64("relayCallGas", relayCallGas).
 		Int("ops", len(calls)).
-		Msg("[ONCHAIN] guard_max_gas_limit")
+		Msg("[ONCHAIN] gas_estimated")
 
 	proxyWallet := deriveProxyWallet(oc.fromAddr)
 	submitBody := relayerSubmitBody{
