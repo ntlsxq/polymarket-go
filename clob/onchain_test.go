@@ -50,6 +50,23 @@ func TestPackRedeemUsesPUSDAsCollateral(t *testing.T) {
 	}
 }
 
+func TestMaxGuardRelayGasLimit(t *testing.T) {
+	data := []byte{0x00, 0x01, 0x02, 0x00}
+	got, intrinsic, err := maxGuardRelayGasLimit(data)
+	if err != nil {
+		t.Fatalf("maxGuardRelayGasLimit: %v", err)
+	}
+
+	wantIntrinsic := uint64(txBaseGas + 2*txDataZeroGas + 2*txDataNonZeroGas)
+	if intrinsic != wantIntrinsic {
+		t.Fatalf("intrinsic=%d want %d", intrinsic, wantIntrinsic)
+	}
+	want := uint64(relayerOuterGasLimit - wantIntrinsic - relayHubGuardReserveGas - relayHubPreGuardGas)
+	if got != want {
+		t.Fatalf("gasLimit=%d want %d", got, want)
+	}
+}
+
 func newTestOnChainClient(t *testing.T) *OnChainClient {
 	t.Helper()
 	initABIs()

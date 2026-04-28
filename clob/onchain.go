@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -29,27 +28,18 @@ const (
 )
 
 const (
-	// gasSlack is a flat buffer added to eth_estimateGas output to absorb
-	// EIP-2929 cold/warm SLOAD drift between simulation and execution, plus
-	// the from-address mismatch (estimate runs from oc.fromAddr, actual
-	// msg.sender at execution is RelayHub→relay). Drift is additive (a few
-	// cold SLOAD transitions), not proportional — so we use a constant, not
-	// a percentage. 30k covers ~10-15 cold→warm transitions with slack.
-	gasSlack = 30_000
-
-	// Fallback gas constants — used only when eth_estimateGas fails.
-	// Polymarket's GSN relayer provisions on-chain tx gas as ~300k × ops +
-	// 250k, so total signed gasLimit must stay below that or RelayHub's
-	// `gasleft() >= gasLimit` check reverts before any proxy call runs.
-	// 300k per-call covers approve/split/merge/convert (150–200k each);
-	// the 100k wrapper overhead covers ProxyWalletFactory.proxy's array
-	// decode + per-call forwarding, measured at ~50k with slack.
-	fallbackGasPerCall      = 300_000
-	fallbackWrapperOverhead = 100_000
-
-	maxUint256Hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-	callTypeCall  = 1
-	relayerURL    = "https://relayer-v2.polymarket.com"
+	// Polymarket's relayer submits RelayHub transactions with a 10M outer gas
+	// limit. RelayHub's guard requires signedGasLimit + 350k reserve to fit
+	// after tx intrinsic/calldata gas and the pre-guard execution cost.
+	relayerOuterGasLimit    = 10_000_000
+	relayHubGuardReserveGas = 350_000
+	relayHubPreGuardGas     = 25_000
+	txBaseGas               = 21_000
+	txDataZeroGas           = 4
+	txDataNonZeroGas        = 16
+	maxUint256Hex           = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	callTypeCall            = 1
+	relayerURL              = "https://relayer-v2.polymarket.com"
 )
 
 const ctfABIJSON = `[
@@ -71,11 +61,16 @@ const proxyWalletFactoryABIJSON = `[
 	{"name":"proxy","type":"function","inputs":[{"name":"calls","type":"tuple[]","components":[{"name":"typeCode","type":"uint8"},{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"}]}],"outputs":[{"name":"","type":"bytes[]"}]}
 ]`
 
+const relayHubABIJSON = `[
+	{"name":"relayCall","type":"function","inputs":[{"name":"from","type":"address"},{"name":"recipient","type":"address"},{"name":"encodedFunction","type":"bytes"},{"name":"transactionFee","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasLimit","type":"uint256"},{"name":"nonce","type":"uint256"},{"name":"signature","type":"bytes"},{"name":"approvalData","type":"bytes"}],"outputs":[]}
+]`
+
 var (
 	ctfABI                abi.ABI
 	negRiskABI            abi.ABI
 	erc20ApproveABI       abi.ABI
 	proxyWalletFactoryABI abi.ABI
+	relayHubABI           abi.ABI
 	abiInitOnce           sync.Once
 	abiInitErr            error
 )
@@ -91,6 +86,7 @@ func initABIs() {
 			{&negRiskABI, negRiskABIJSON, "NegRisk"},
 			{&erc20ApproveABI, erc20ApproveABIJSON, "ERC20"},
 			{&proxyWalletFactoryABI, proxyWalletFactoryABIJSON, "ProxyWalletFactory"},
+			{&relayHubABI, relayHubABIJSON, "RelayHub"},
 		} {
 			a, err := abi.JSON(strings.NewReader(p.json))
 			if err != nil {
@@ -175,19 +171,6 @@ func (oc *OnChainClient) Close() {
 	if oc.eth != nil {
 		oc.eth.Close()
 	}
-}
-
-// estimateProxyGas calls eth_estimateGas on ProxyWalletFactory.proxy(calls)
-// from the signer EOA. Returns the raw estimate; the caller adds gasSlack.
-// A non-nil error means the static fallback should be used.
-func (oc *OnChainClient) estimateProxyGas(ctx context.Context, encodedFunction []byte) (uint64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return oc.eth.EstimateGas(ctx, ethereum.CallMsg{
-		From: oc.fromAddr,
-		To:   &oc.factoryAddr,
-		Data: encodedFunction,
-	})
 }
 
 func (oc *OnChainClient) SplitPosition(ctx context.Context, conditionId string, amount int, negRisk bool) (string, error) {

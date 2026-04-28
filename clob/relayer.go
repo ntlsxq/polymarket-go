@@ -146,8 +146,6 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 		return "", ctx.Err()
 	}
 
-	zero := big.NewInt(0)
-
 	encodedFunction, err := proxyWalletFactoryABI.Pack("proxy", calls)
 	if err != nil {
 		return "", fmt.Errorf("pack proxy: %w", err)
@@ -182,40 +180,17 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 	nonceBig := new(big.Int)
 	nonceBig.SetString(rp.Nonce, 10)
 
-	var gasLimit uint64
-	if est, err := oc.estimateProxyGas(ctx, encodedFunction); err == nil {
-		gasLimit = est + gasSlack
-		log.Debug().Uint64("estimate", est).Uint64("gasLimit", gasLimit).Int("ops", len(calls)).Msg("[ONCHAIN] gas_estimated")
-	} else {
-		gasLimit = uint64(len(calls))*fallbackGasPerCall + fallbackWrapperOverhead
-		log.Warn().Err(err).Uint64("gasLimit", gasLimit).Int("ops", len(calls)).Msg("[ONCHAIN] estimate_failed_using_fallback")
-	}
-	gasLimitBig := new(big.Int).SetUint64(gasLimit)
-
 	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")
 
-	relayHash := crypto.Keccak256(encodePacked(
-		[]byte("rlx:"),
-		oc.fromAddr.Bytes(),
-		oc.factoryAddr.Bytes(),
-		encodedFunction,
-		encodeUint256(zero),
-		encodeUint256(zero),
-		encodeUint256(gasLimitBig),
-		encodeUint256(nonceBig),
-		oc.relayHub.Bytes(),
-		relayAddr.Bytes(),
-	))
-
-	ethSignedHash := crypto.Keccak256(encodePacked(
-		[]byte("\x19Ethereum Signed Message:\n32"),
-		relayHash,
-	))
-	sigBytes, err := crypto.Sign(ethSignedHash, oc.privKey)
+	gasLimit, sigBytes, relayCallGas, err := oc.signMaxGuardRelay(encodedFunction, relayAddr, nonceBig)
 	if err != nil {
-		return "", fmt.Errorf("sign: %w", err)
+		return "", err
 	}
-	sigBytes[64] += 27
+	log.Debug().
+		Uint64("gasLimit", gasLimit).
+		Uint64("relayCallGas", relayCallGas).
+		Int("ops", len(calls)).
+		Msg("[ONCHAIN] guard_max_gas_limit")
 
 	proxyWallet := deriveProxyWallet(oc.fromAddr)
 	submitBody := relayerSubmitBody{
@@ -278,6 +253,108 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 
 	log.Debug().Str("txID", txID).Msg("[ONCHAIN] relayer_ok")
 	return txID, nil
+}
+
+func (oc *OnChainClient) signMaxGuardRelay(encodedFunction []byte, relayAddr common.Address, nonceBig *big.Int) (uint64, []byte, uint64, error) {
+	gasLimit := uint64(relayerOuterGasLimit - relayHubGuardReserveGas - relayHubPreGuardGas - txBaseGas)
+	var bestGas uint64
+	var bestSig []byte
+	var bestRelayCallGas uint64
+
+	for i := 0; i < 12; i++ {
+		sigBytes, err := oc.signProxyRelay(encodedFunction, gasLimit, relayAddr, nonceBig)
+		if err != nil {
+			return 0, nil, 0, fmt.Errorf("sign: %w", err)
+		}
+		relayCallData, err := oc.packRelayCall(encodedFunction, gasLimit, relayAddr, nonceBig, sigBytes)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		maxGas, relayCallGas, err := maxGuardRelayGasLimit(relayCallData)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if gasLimit <= maxGas && gasLimit > bestGas {
+			bestGas = gasLimit
+			bestSig = sigBytes
+			bestRelayCallGas = relayCallGas
+		}
+		if gasLimit == maxGas {
+			return gasLimit, sigBytes, relayCallGas, nil
+		}
+		gasLimit = maxGas
+	}
+
+	if bestGas == 0 {
+		return 0, nil, 0, fmt.Errorf("could not find relay gas limit passing RelayHub guard")
+	}
+	return bestGas, bestSig, bestRelayCallGas, nil
+}
+
+func (oc *OnChainClient) signProxyRelay(encodedFunction []byte, gasLimit uint64, relayAddr common.Address, nonceBig *big.Int) ([]byte, error) {
+	zero := big.NewInt(0)
+	gasLimitBig := new(big.Int).SetUint64(gasLimit)
+
+	relayHash := crypto.Keccak256(encodePacked(
+		[]byte("rlx:"),
+		oc.fromAddr.Bytes(),
+		oc.factoryAddr.Bytes(),
+		encodedFunction,
+		encodeUint256(zero),
+		encodeUint256(zero),
+		encodeUint256(gasLimitBig),
+		encodeUint256(nonceBig),
+		oc.relayHub.Bytes(),
+		relayAddr.Bytes(),
+	))
+
+	ethSignedHash := crypto.Keccak256(encodePacked(
+		[]byte("\x19Ethereum Signed Message:\n32"),
+		relayHash,
+	))
+	sigBytes, err := crypto.Sign(ethSignedHash, oc.privKey)
+	if err != nil {
+		return nil, err
+	}
+	sigBytes[64] += 27
+	return sigBytes, nil
+}
+
+func (oc *OnChainClient) packRelayCall(encodedFunction []byte, gasLimit uint64, relayAddr common.Address, nonceBig *big.Int, sigBytes []byte) ([]byte, error) {
+	zero := big.NewInt(0)
+	return relayHubABI.Pack(
+		"relayCall",
+		oc.fromAddr,
+		oc.factoryAddr,
+		encodedFunction,
+		zero,
+		zero,
+		new(big.Int).SetUint64(gasLimit),
+		nonceBig,
+		sigBytes,
+		[]byte{},
+	)
+}
+
+func maxGuardRelayGasLimit(relayCallData []byte) (uint64, uint64, error) {
+	relayCallGas := relayCallIntrinsicGas(relayCallData)
+	requiredBeforeUserCall := relayCallGas + relayHubGuardReserveGas + relayHubPreGuardGas
+	if requiredBeforeUserCall >= relayerOuterGasLimit {
+		return 0, relayCallGas, fmt.Errorf("relay calldata too large: intrinsic=%d guard=%d preGuard=%d outer=%d", relayCallGas, relayHubGuardReserveGas, relayHubPreGuardGas, relayerOuterGasLimit)
+	}
+	return relayerOuterGasLimit - requiredBeforeUserCall, relayCallGas, nil
+}
+
+func relayCallIntrinsicGas(data []byte) uint64 {
+	gas := uint64(txBaseGas)
+	for _, b := range data {
+		if b == 0 {
+			gas += txDataZeroGas
+		} else {
+			gas += txDataNonZeroGas
+		}
+	}
+	return gas
 }
 
 func deriveProxyWallet(signer common.Address) common.Address {
