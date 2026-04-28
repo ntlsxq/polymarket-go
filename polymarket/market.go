@@ -110,13 +110,13 @@ func (fp FeeParams) FeePerShareKey(pk int32) float64 {
 	return fp.FeePerShareWithRate(float64(pk)/10000.0, fp.Rate)
 }
 
-// FeePerShareWithRate returns the CTFExchange taker fee in USDC per gross
+// FeePerShareWithRate returns the CTFExchange taker fee in pUSD per gross
 // share bought:
 //
-//	fee_usdc_per_share = rate × p × (1-p) × (1 - Rebate)
+//	fee_per_share = rate × p × (1-p) × (1 - Rebate)
 //
 // The on-chain protocol takes 10% of shares on the cheap side of the pair;
-// in USDC that's symmetric in p, hence rate × p × (1-p). Rate is already
+// in collateral units that's symmetric in p, hence rate × p × (1-p). Rate is already
 // the post-rebate effective rate (≈ 0.072 empirically); Rebate is a
 // further discount knob layered on top.
 func (fp FeeParams) FeePerShareWithRate(p, rate float64) float64 {

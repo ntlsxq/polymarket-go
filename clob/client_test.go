@@ -44,7 +44,7 @@ func TestComputeOrderAmountsParity(t *testing.T) {
 // TestComputeOrderAmountsBuyShape pins the symbolic identity:
 // for BUY at size=10, price=0.55, tick=0.01:
 //
-//	maker (USDC, 6dec) = 10 × 0.55 × 1_000_000 = 5_500_000
+//	maker (pUSD, 6dec) = 10 × 0.55 × 1_000_000 = 5_500_000
 //	taker (CTF,  6dec) = 10        × 1_000_000 = 10_000_000
 func TestComputeOrderAmountsBuyShape(t *testing.T) {
 	rc := RoundingConfigs["0.01"]
@@ -57,7 +57,7 @@ func TestComputeOrderAmountsBuyShape(t *testing.T) {
 func TestComputeOrderAmountsSellShape(t *testing.T) {
 	rc := RoundingConfigs["0.01"]
 	side, maker, taker := computeOrderAmounts(SideSell, 10, 0.55, rc)
-	// SELL: maker = shares, taker = USDC
+	// SELL: maker = shares, taker = pUSD
 	if side != SideSellInt || maker != 10_000_000 || taker != 5_500_000 {
 		t.Fatalf("SELL 10@0.55: side=%d maker=%d taker=%d", side, maker, taker)
 	}

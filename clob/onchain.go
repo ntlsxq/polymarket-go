@@ -21,11 +21,11 @@ import (
 const (
 	CTFAddr                = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 	NegRiskCTFAddr         = "0xd91e80cF2E7be2e162c6513ceD06f1dD0dA35296"
-	USDCAddr               = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+	PUSDAddr               = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 	GSNRelayHub            = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
 	ProxyWalletFactoryAddr = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
 	ProxyInitCodeHash      = "d21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
-	USDCDecimals           = 6
+	PUSDDecimals           = 6
 )
 
 const (
@@ -122,7 +122,7 @@ type OnChainClient struct {
 	factoryAddr    common.Address
 	ctfAddr        common.Address
 	negRiskCTFAddr common.Address
-	usdcAddr       common.Address
+	collateralAddr common.Address
 	relayHub       common.Address
 	relayerAPIKey  string
 	approvedMu     sync.Mutex
@@ -164,7 +164,7 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 		factoryAddr:    common.HexToAddress(ProxyWalletFactoryAddr),
 		ctfAddr:        common.HexToAddress(CTFAddr),
 		negRiskCTFAddr: common.HexToAddress(NegRiskCTFAddr),
-		usdcAddr:       common.HexToAddress(USDCAddr),
+		collateralAddr: common.HexToAddress(PUSDAddr),
 		relayHub:       common.HexToAddress(GSNRelayHub),
 		relayerAPIKey:  cfg.RelayerAPIKey,
 		approved:       make(map[common.Address]bool),
@@ -226,7 +226,7 @@ func (oc *OnChainClient) packSplitMerge(method, conditionId string, amount int, 
 	if negRisk {
 		target = oc.negRiskCTFAddr
 	}
-	calldata, err := ctfABI.Pack(method, oc.usdcAddr, parentCollectionIDZero, condID, BinaryPartition, amountBig)
+	calldata, err := ctfABI.Pack(method, oc.collateralAddr, parentCollectionIDZero, condID, BinaryPartition, amountBig)
 	return target, calldata, err
 }
 
@@ -244,7 +244,7 @@ func (oc *OnChainClient) packRedeem(conditionId string) (common.Address, []byte,
 	condBytes := common.FromHex(conditionId)
 	copy(condID[32-len(condBytes):], condBytes)
 
-	calldata, err := ctfABI.Pack("redeemPositions", oc.usdcAddr, parentCollectionIDZero, condID, BinaryPartition)
+	calldata, err := ctfABI.Pack("redeemPositions", oc.collateralAddr, parentCollectionIDZero, condID, BinaryPartition)
 	return oc.ctfAddr, calldata, err
 }
 
@@ -330,7 +330,7 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 		b.err = err
 		return b
 	}
-	b.ops = append(b.ops, txOp{b.oc.usdcAddr, calldata})
+	b.ops = append(b.ops, txOp{b.oc.collateralAddr, calldata})
 
 	if negRisk {
 		cd, err := ctfABI.Pack("setApprovalForAll", b.oc.negRiskCTFAddr, true)
@@ -376,7 +376,7 @@ func (oc *OnChainClient) EnsureApproval(ctx context.Context, spender common.Addr
 	if err != nil {
 		return "", err
 	}
-	txID, err := oc.sendProxyTx(ctx, oc.usdcAddr, calldata)
+	txID, err := oc.sendProxyTx(ctx, oc.collateralAddr, calldata)
 	if err != nil {
 		return "", fmt.Errorf("approve: %w", err)
 	}

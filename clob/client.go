@@ -263,8 +263,8 @@ const MinBuyShares = 5.0
 
 // BuyFeeRate returns the CTFExchange BUY taker fee as a fraction of gross
 // shares (i.e. shares_received = gross × (1 - BuyFeeRate)). Derived from
-// the docs formula fee_usdc = rate × p × (1-p) × size, divided by price
-// to convert USDC → shares on the bought side:
+// the docs formula fee = rate × p × (1-p) × size, divided by price
+// to convert collateral → shares on the bought side:
 //
 //	fee_rate_on_shares = rate × (1 - p)
 //
@@ -375,7 +375,7 @@ var pow10Int = [7]int64{1, 10, 100, 1000, 10000, 100000, 1000000}
 const tokenDecimalsExp = 6
 
 // computeOrderAmounts returns the side-flag plus maker/taker amounts in
-// 6-decimal token units (USDC for the price-side, CTF shares for the
+// 6-decimal token units (pUSD for the price-side, CTF shares for the
 // size-side). For the standard Polymarket tick configs (rc.Size = 2,
 // rc.Price ∈ {1..4}) it runs a pure int64 path: zero allocs, no decimal
 // library overhead, and bit-exact result vs. the decimal reference path
@@ -394,15 +394,15 @@ func computeOrderAmounts(side string, size, price float64, rc RoundConfig) (side
 	priceUnits := int64(math.Round(price * float64(pow10Int[rc.Price])))
 
 	sharesScale := pow10Int[tokenDecimalsExp-rc.Size]
-	usdcScale := pow10Int[tokenDecimalsExp-rc.Size-rc.Price]
+	collateralScale := pow10Int[tokenDecimalsExp-rc.Size-rc.Price]
 
 	sharesUnits := sizeUnits * sharesScale
-	usdcUnits := sizeUnits * priceUnits * usdcScale
+	collateralUnits := sizeUnits * priceUnits * collateralScale
 
 	if side == SideBuy {
-		return SideBuyInt, usdcUnits, sharesUnits
+		return SideBuyInt, collateralUnits, sharesUnits
 	}
-	return SideSellInt, sharesUnits, usdcUnits
+	return SideSellInt, sharesUnits, collateralUnits
 }
 
 // computeOrderAmountsDecimal is the original arbitrary-precision path,

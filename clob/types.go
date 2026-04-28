@@ -129,7 +129,7 @@ type CancelResponse struct {
 
 // BalanceAllowance is GET /balance-allowance response.
 // Polymarket serves two shapes depending on API version: older { balance, allowance }
-// (both strings in USDC 6-decimal units) and newer { balance, allowances: {addr: ""} }.
+// (both strings in pUSD 6-decimal units) and newer { balance, allowances: {addr: ""} }.
 type BalanceAllowance struct {
 	Balance    string            `json:"balance"`
 	Allowance  string            `json:"allowance,omitempty"`
