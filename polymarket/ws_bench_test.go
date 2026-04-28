@@ -4,18 +4,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/ntlsxq/polymarket-go/book"
 )
 
-// freshDispatcher rebuilds a ready MarketWS+Manager pair so each bench is
-// isolated.
-func freshDispatcher() (*MarketWS, *book.Manager) {
-	mgr := book.NewManager([]book.Token{
-		{Key: "k1", ID: yesTID, IsYes: true},
-		{Key: "k1", ID: noTID, IsYes: false},
-	})
-	return NewMarketWS(mgr), mgr
+func freshDispatcher() *MarketWS {
+	return NewMarketWS([]string{yesTID, noTID}, WithOnMarketEvent(func(MarketWSEvent) {}))
 }
 
 func priceChangeArrayFrame(n int) []byte {
@@ -68,12 +60,10 @@ func lastTradeFrame(seq int) []byte {
 		yesTID, seq))
 }
 
-// BenchmarkDispatchPriceChange measures the typical hot-path event:
-// price_change with a few entries packed into an array frame.
 func BenchmarkDispatchPriceChange(b *testing.B) {
 	for _, n := range []int{1, 4, 16} {
 		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
-			ws, _ := freshDispatcher()
+			ws := freshDispatcher()
 			raw := priceChangeArrayFrame(n)
 			b.ReportAllocs()
 			b.SetBytes(int64(len(raw)))
@@ -85,12 +75,10 @@ func BenchmarkDispatchPriceChange(b *testing.B) {
 	}
 }
 
-// BenchmarkDispatchBookSnapshot measures the cost of a "book" event — full
-// SetFromSnapshot. n is per-side level count.
 func BenchmarkDispatchBookSnapshot(b *testing.B) {
 	for _, n := range []int{10, 50} {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			ws, _ := freshDispatcher()
+			ws := freshDispatcher()
 			raw := bookSnapshotFrame(n)
 			b.ReportAllocs()
 			b.SetBytes(int64(len(raw)))
@@ -102,14 +90,8 @@ func BenchmarkDispatchBookSnapshot(b *testing.B) {
 	}
 }
 
-// BenchmarkDispatchBestBidAsk is the cheapest event type (single reconcile).
-// Useful as a baseline for envelope-parsing overhead.
 func BenchmarkDispatchBestBidAsk(b *testing.B) {
-	ws, mgr := freshDispatcher()
-	mgr.OBForToken(yesTID).SetFromSnapshot(
-		[]book.BookLevel{{Price: 0.50, Size: 5}, {Price: 0.51, Size: 3}},
-		[]book.BookLevel{{Price: 0.55, Size: 3}, {Price: 0.54, Size: 5}},
-	)
+	ws := freshDispatcher()
 	raw := bestBidAskFrame()
 	b.ReportAllocs()
 	b.SetBytes(int64(len(raw)))
@@ -119,12 +101,8 @@ func BenchmarkDispatchBestBidAsk(b *testing.B) {
 	}
 }
 
-// BenchmarkDispatchLastTradePrice issues unique tx-hashes so dedup always
-// passes — mirrors steady-state trade frequency.
 func BenchmarkDispatchLastTradePrice(b *testing.B) {
-	ws, mgr := freshDispatcher()
-	mgr.OBForToken(yesTID).SetFromSnapshot(nil,
-		[]book.BookLevel{{Price: 0.51, Size: float64(b.N + 1_000_000)}})
+	ws := freshDispatcher()
 	frames := make([][]byte, 1024)
 	for i := range frames {
 		frames[i] = lastTradeFrame(i)
@@ -136,14 +114,8 @@ func BenchmarkDispatchLastTradePrice(b *testing.B) {
 	}
 }
 
-// BenchmarkDispatchMixedRealistic alternates the dominant frame types in the
-// approximate ratio observed on prod (price_change ≫ best_bid_ask > trade ≫ book).
 func BenchmarkDispatchMixedRealistic(b *testing.B) {
-	ws, mgr := freshDispatcher()
-	mgr.OBForToken(yesTID).SetFromSnapshot(
-		[]book.BookLevel{{Price: 0.50, Size: 10}, {Price: 0.49, Size: 20}, {Price: 0.48, Size: 30}},
-		[]book.BookLevel{{Price: 0.51, Size: 10}, {Price: 0.52, Size: 20}, {Price: 0.53, Size: 30}},
-	)
+	ws := freshDispatcher()
 	pcSmall := priceChangeArrayFrame(2)
 	bba := bestBidAskFrame()
 	tradeFrames := make([][]byte, 256)

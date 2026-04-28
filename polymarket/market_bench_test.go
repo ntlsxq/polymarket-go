@@ -57,7 +57,7 @@ func BenchmarkFeePerShareConstant(b *testing.B) {
 }
 
 // BenchmarkFeePerShareKey is the int32-tick-keyed variant — the hot path
-// for callers that already hold a price key (book.OrderBook int32 prices).
+// for callers that already hold a price key.
 // Skips the math.Round + multiplication.
 func BenchmarkFeePerShareKey(b *testing.B) {
 	fp := NewFeeParams(0.072, 0)

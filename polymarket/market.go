@@ -100,9 +100,9 @@ func (fp FeeParams) FeePerShare(p float64) float64 {
 }
 
 // FeePerShareKey is the hot-path variant of FeePerShare for callers that
-// already hold the int32 tick key (e.g. anything reading book.OrderBook
-// internals). Skips the math.Round + multiplication that FeePerShare needs
-// to recover the index from a float64. Returns 0 for out-of-range keys.
+// already hold the int32 tick key. Skips the math.Round + multiplication
+// that FeePerShare needs to recover the index from a float64. Returns 0
+// for out-of-range keys.
 func (fp FeeParams) FeePerShareKey(pk int32) float64 {
 	if fp.cache != nil && pk >= 0 && int(pk) < feeCacheSize {
 		return fp.cache[pk]

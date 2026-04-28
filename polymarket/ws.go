@@ -2,7 +2,6 @@ package polymarket
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,8 +9,6 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
-
-	"github.com/ntlsxq/polymarket-go/book"
 )
 
 // Outbound subscribe payload for the market-WS endpoint.
@@ -37,6 +34,91 @@ type wsPriceChangeEntry struct {
 	Side    string `json:"side"`
 	Price   string `json:"price"`
 	Size    string `json:"size"`
+}
+
+type MarketWSEventType string
+
+const (
+	MarketWSEventBook           MarketWSEventType = "book"
+	MarketWSEventPriceChange    MarketWSEventType = "price_change"
+	MarketWSEventBestBidAsk     MarketWSEventType = "best_bid_ask"
+	MarketWSEventLastTradePrice MarketWSEventType = "last_trade_price"
+	MarketWSEventTickSizeChange MarketWSEventType = "tick_size_change"
+	MarketWSEventNewMarket      MarketWSEventType = "new_market"
+	MarketWSEventResolved       MarketWSEventType = "market_resolved"
+)
+
+type MarketWSBookEvent struct {
+	AssetID string
+	Bids    []MarketWSBookLevel
+	Asks    []MarketWSBookLevel
+}
+
+type MarketWSBookLevel struct {
+	Price float64
+	Size  float64
+}
+
+type MarketWSPriceChange struct {
+	AssetID string
+	Side    string
+	Price   string
+	Size    string
+}
+
+type MarketWSPriceChangeEvent struct {
+	Changes []MarketWSPriceChange
+}
+
+type MarketWSBestBidAskEvent struct {
+	AssetID string
+	BestBid string
+	BestAsk string
+}
+
+type MarketWSLastTradePriceEvent struct {
+	AssetID         string
+	Side            string
+	Price           string
+	Size            string
+	TransactionHash string
+}
+
+type MarketWSTickSizeChangeEvent struct {
+	AssetID     string
+	OldTickSize string
+	NewTickSize string
+}
+
+type MarketWSNewMarketEvent struct {
+	ConditionID           string
+	Market                string
+	Slug                  string
+	GroupItemTitle        string
+	Line                  string
+	OrderPriceMinTickSize string
+	AssetIDs              []string
+	ClobTokenIDs          []string
+}
+
+type MarketWSResolvedEvent struct {
+	ConditionID    string
+	Market         string
+	WinningAssetID string
+	WinningOutcome string
+	AssetIDs       []string
+}
+
+type MarketWSEvent struct {
+	Type           MarketWSEventType
+	Raw            []byte
+	Book           *MarketWSBookEvent
+	PriceChange    *MarketWSPriceChangeEvent
+	BestBidAsk     *MarketWSBestBidAskEvent
+	LastTradePrice *MarketWSLastTradePriceEvent
+	TickSizeChange *MarketWSTickSizeChangeEvent
+	NewMarket      *MarketWSNewMarketEvent
+	Resolved       *MarketWSResolvedEvent
 }
 
 // wsItem is the union shape used by dispatch to decode every event type
@@ -69,6 +151,22 @@ type wsItem struct {
 	// tick_size_change
 	TickSize        string `json:"tick_size"`
 	MinimumTickSize string `json:"minimum_tick_size"`
+	NewTickSize     string `json:"new_tick_size"`
+	OldTickSize     string `json:"old_tick_size"`
+
+	// new_market / market_resolved
+	Market                string   `json:"market"`
+	ConditionID           string   `json:"condition_id"`
+	ConditionIDAlt        string   `json:"conditionId"`
+	Slug                  string   `json:"slug"`
+	GroupItemTitle        string   `json:"group_item_title"`
+	Line                  string   `json:"line"`
+	OrderPriceMinTickSize string   `json:"order_price_min_tick_size"`
+	AssetsIDs             []string `json:"assets_ids"`
+	AssetIDs              []string `json:"asset_ids"`
+	ClobTokenIDs          []string `json:"clob_token_ids"`
+	WinningAssetID        string   `json:"winning_asset_id"`
+	WinningOutcome        string   `json:"winning_outcome"`
 }
 
 // wsLastTradePriceMsg is the payload-only projection used by parseLastTradePrice
@@ -81,17 +179,15 @@ type wsLastTradePriceMsg struct {
 	TransactionHash string `json:"transaction_hash"`
 }
 
-
 const wsMarketURL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 type MarketWS struct {
-	books            *book.Manager
-	events           WSEventLogger
-	onPriceChange    func()
-	onTickSizeChange func(tokenID, newTickSize string)
-	onConnect        func()
-	onDisconnect     func()
-	filter           func(raw []byte) bool
+	tokenIDs      []string
+	events        WSEventLogger
+	onMarketEvent func(MarketWSEvent)
+	onConnect     func()
+	onDisconnect  func()
+	filter        func(raw []byte) bool
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -102,10 +198,9 @@ type MarketWS struct {
 
 type WSOption func(*MarketWS)
 
-func WithDeadman(sec int) WSOption         { return func(ws *MarketWS) { ws.deadmanSec = sec } }
-func WithOnPriceChange(fn func()) WSOption { return func(ws *MarketWS) { ws.onPriceChange = fn } }
-func WithOnTickSizeChange(fn func(tokenID, newTickSize string)) WSOption {
-	return func(ws *MarketWS) { ws.onTickSizeChange = fn }
+func WithDeadman(sec int) WSOption { return func(ws *MarketWS) { ws.deadmanSec = sec } }
+func WithOnMarketEvent(fn func(MarketWSEvent)) WSOption {
+	return func(ws *MarketWS) { ws.onMarketEvent = fn }
 }
 func WithOnConnect(fn func()) WSOption    { return func(ws *MarketWS) { ws.onConnect = fn } }
 func WithOnDisconnect(fn func()) WSOption { return func(ws *MarketWS) { ws.onDisconnect = fn } }
@@ -115,19 +210,19 @@ func WithEventLog(el WSEventLogger) WSOption {
 
 func (ws *MarketWS) SetEventLog(el WSEventLogger) { ws.events = el }
 
+func (ws *MarketWS) SetOnMarketEvent(fn func(MarketWSEvent)) { ws.onMarketEvent = fn }
+
 // SetFilter installs a pre-dispatch hook: Run calls filter(raw) and drops the
-// frame on false. Used to plug a Deduper when this WS is one of N redundant
-// streams sharing a source.
+// frame on false.
 func (ws *MarketWS) SetFilter(fn func(raw []byte) bool) { ws.filter = fn }
 
-// SetOnConnect / SetOnDisconnect let a Pool aggregate per-member connection
-// state without going through the construction-time WSOption path.
+// SetOnConnect / SetOnDisconnect install connection state callbacks.
 func (ws *MarketWS) SetOnConnect(fn func())    { ws.onConnect = fn }
 func (ws *MarketWS) SetOnDisconnect(fn func()) { ws.onDisconnect = fn }
 
-func NewMarketWS(books *book.Manager, opts ...WSOption) *MarketWS {
+func NewMarketWS(tokenIDs []string, opts ...WSOption) *MarketWS {
 	ws := &MarketWS{
-		books:      books,
+		tokenIDs:   append([]string(nil), tokenIDs...),
 		deadmanSec: 30,
 	}
 	for _, opt := range opts {
@@ -165,7 +260,7 @@ func (ws *MarketWS) UnsubscribeTokens(tokenIDs []string) {
 func (ws *MarketWS) Connected() bool { return ws.connected.Load() }
 
 func (ws *MarketWS) Run(ctx context.Context) {
-	batches := batchStrings(ws.books.AllTokenIDs(), 100)
+	batches := batchStrings(ws.tokenIDs, 100)
 
 	wsLoop(ctx, wsCallbacks{
 		tag: "WS",
@@ -221,14 +316,9 @@ func (ws *MarketWS) Run(ctx context.Context) {
 	})
 }
 
-// dispatch routes one wire frame through the per-event handlers. Polymarket
-// emits both wrapped arrays ([{...},{...}]) and bare objects ({...}); we
-// branch on the first non-whitespace byte instead of attempting an array
-// unmarshal first, which dropped one alloc + one parse on every object
-// frame in the baseline. Each item is then decoded once into its typed
-// shape (envelope-only decode is gone — handle() unmarshals into the same
-// struct that carries the event_type tag, so envelope and payload share a
-// single Unmarshal pass).
+// dispatch routes one wire frame through the typed market-event callback.
+// Polymarket emits both wrapped arrays ([{...},{...}]) and bare objects
+// ({...}); branch on the first non-whitespace byte to avoid double parses.
 func (ws *MarketWS) dispatch(raw []byte) {
 	if ws.filter != nil && !ws.filter(raw) {
 		return
@@ -240,21 +330,13 @@ func (ws *MarketWS) dispatch(raw []byte) {
 		if json.Unmarshal(raw, &items) != nil {
 			return
 		}
-		changed := false
 		for _, item := range items {
-			if ws.dispatchOne(recvTs, item) {
-				changed = true
-			}
-		}
-		if changed && ws.onPriceChange != nil {
-			ws.onPriceChange()
+			ws.dispatchOne(recvTs, item)
 		}
 		return
 	}
 
-	if ws.dispatchOne(recvTs, raw) && ws.onPriceChange != nil {
-		ws.onPriceChange()
-	}
+	ws.dispatchOne(recvTs, raw)
 }
 
 // firstNonSpace returns the first non-whitespace byte of b, or 0 when b
@@ -272,125 +354,117 @@ func firstNonSpace(b []byte) byte {
 }
 
 // dispatchOne decodes a single item once into wsItem (union of all event
-// shapes) and routes by EventType. One Unmarshal pass per item replaces
-// the previous envelope+payload double-decode.
-func (ws *MarketWS) dispatchOne(recvTs time.Time, raw json.RawMessage) bool {
+// shapes) and emits a typed event. No orderbook state lives in this package.
+func (ws *MarketWS) dispatchOne(recvTs time.Time, raw json.RawMessage) {
 	var it wsItem
 	if json.Unmarshal(raw, &it) != nil {
-		return false
+		return
 	}
 	if ws.events != nil {
 		ws.events.LogWSEvent(recvTs, "market", it.EventType, raw)
 	}
-	return ws.handleItem(&it)
+	if ws.onMarketEvent != nil {
+		ws.onMarketEvent(marketWSEventFromItem(&it, raw))
+	}
 }
 
-func (ws *MarketWS) handleItem(it *wsItem) bool {
-	switch it.EventType {
-	case "book":
-		ob := ws.books.OBForToken(it.AssetID)
-		if ob == nil {
-			return false
+func marketWSEventFromItem(it *wsItem, raw []byte) MarketWSEvent {
+	ev := MarketWSEvent{
+		Type: MarketWSEventType(it.EventType),
+		Raw:  append([]byte(nil), raw...),
+	}
+	switch ev.Type {
+	case MarketWSEventBook:
+		ev.Book = &MarketWSBookEvent{
+			AssetID: it.AssetID,
+			Bids:    toBookLevels(it.Bids),
+			Asks:    toBookLevels(it.Asks),
 		}
-		ob.SetFromSnapshot(toBookLevels(it.Bids), toBookLevels(it.Asks))
-		return true
-
-	case "price_change":
-		changed := false
+	case MarketWSEventPriceChange:
+		changes := make([]MarketWSPriceChange, 0, len(it.PriceChanges))
 		for i := range it.PriceChanges {
-			ch := &it.PriceChanges[i]
-			ob := ws.books.OBForToken(ch.AssetID)
-			if ob == nil {
-				continue
-			}
-			side, ok := book.ParseSide(ch.Side)
-			if !ok {
-				continue
-			}
-			pk, ok := book.ParseTick(ch.Price)
-			if !ok {
-				continue
-			}
-			s, _ := strconv.ParseFloat(ch.Size, 64)
-			ob.UpdateLevelKey(side, pk, s)
-			changed = true
+			ch := it.PriceChanges[i]
+			changes = append(changes, MarketWSPriceChange{
+				AssetID: ch.AssetID,
+				Side:    ch.Side,
+				Price:   ch.Price,
+				Size:    ch.Size,
+			})
 		}
-		return changed
-
-	case "best_bid_ask":
-		ob := ws.books.OBForToken(it.AssetID)
-		if ob == nil {
-			return false
+		ev.PriceChange = &MarketWSPriceChangeEvent{Changes: changes}
+	case MarketWSEventBestBidAsk:
+		ev.BestBidAsk = &MarketWSBestBidAskEvent{
+			AssetID: it.AssetID,
+			BestBid: it.BestBid,
+			BestAsk: it.BestAsk,
 		}
-		bb, _ := strconv.ParseFloat(it.BestBid, 64)
-		ba, _ := strconv.ParseFloat(it.BestAsk, 64)
-		ob.ReconcileTop(bb, ba)
-		return true
-
-	case "last_trade_price":
-		side, ok := book.ParseSide(it.Side)
-		if !ok {
-			return false
+	case MarketWSEventLastTradePrice:
+		ev.LastTradePrice = &MarketWSLastTradePriceEvent{
+			AssetID:         it.AssetID,
+			Side:            it.Side,
+			Price:           it.Price,
+			Size:            it.Size,
+			TransactionHash: it.TransactionHash,
 		}
-		pk, ok := book.ParseTick(it.Price)
-		if !ok || pk <= 0 {
-			return false
-		}
-		s, _ := strconv.ParseFloat(it.Size, 64)
-		if s <= 0 {
-			return false
-		}
-		return ws.books.IngestTrade(it.AssetID, book.Trade{
-			Hash:  it.TransactionHash,
-			Side:  side,
-			Price: book.ToFloat(pk),
-			Size:  s,
-		})
-
-	case "tick_size_change":
+	case MarketWSEventTickSizeChange:
 		tick := it.TickSize
+		if tick == "" {
+			tick = it.NewTickSize
+		}
 		if tick == "" {
 			tick = it.MinimumTickSize
 		}
-		if it.AssetID == "" || tick == "" {
-			return false
+		ev.TickSizeChange = &MarketWSTickSizeChangeEvent{
+			AssetID:     it.AssetID,
+			OldTickSize: it.OldTickSize,
+			NewTickSize: tick,
 		}
-		ws.books.SetTickSize(it.AssetID, tick)
-		if ws.onTickSizeChange != nil {
-			ws.onTickSizeChange(it.AssetID, tick)
+	case MarketWSEventNewMarket:
+		ev.NewMarket = &MarketWSNewMarketEvent{
+			ConditionID:           firstNonEmpty(it.ConditionID, it.ConditionIDAlt),
+			Market:                it.Market,
+			Slug:                  it.Slug,
+			GroupItemTitle:        it.GroupItemTitle,
+			Line:                  it.Line,
+			OrderPriceMinTickSize: it.OrderPriceMinTickSize,
+			AssetIDs:              firstNonEmptySlice(it.AssetsIDs, it.AssetIDs),
+			ClobTokenIDs:          it.ClobTokenIDs,
 		}
-		return true
+	case MarketWSEventResolved:
+		ev.Resolved = &MarketWSResolvedEvent{
+			ConditionID:    firstNonEmpty(it.ConditionID, it.ConditionIDAlt),
+			Market:         it.Market,
+			WinningAssetID: it.WinningAssetID,
+			WinningOutcome: it.WinningOutcome,
+			AssetIDs:       firstNonEmptySlice(it.AssetsIDs, it.AssetIDs),
+		}
 	}
-	return false
+	return ev
 }
 
-// parseLastTradePrice extracts a typed book.Trade from a market-ws
-// last_trade_price frame. Returns ok=false when any required field is
-// missing or invalid, so the dispatcher can drop the frame without
-// touching the book.
-func parseLastTradePrice(msg wsLastTradePriceMsg) (book.Trade, string, bool) {
-	side, ok := book.ParseSide(msg.Side)
-	if !ok {
-		return book.Trade{}, "", false
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
 	}
-	p, _ := strconv.ParseFloat(msg.Price, 64)
-	s, _ := strconv.ParseFloat(msg.Size, 64)
-	if p <= 0 || s <= 0 {
-		return book.Trade{}, "", false
-	}
-	return book.Trade{
-		Hash:  msg.TransactionHash,
-		Side:  side,
-		Price: p,
-		Size:  s,
-	}, msg.AssetID, true
+	return ""
 }
 
-func toBookLevels(in []wsBookLevel) []book.BookLevel {
-	out := make([]book.BookLevel, 0, len(in))
+func firstNonEmptySlice(values ...[]string) []string {
+	for _, v := range values {
+		if len(v) > 0 {
+			return append([]string(nil), v...)
+		}
+	}
+	return nil
+}
+
+func toBookLevels(in []wsBookLevel) []MarketWSBookLevel {
+	out := make([]MarketWSBookLevel, 0, len(in))
 	for _, e := range in {
 		if e.Price > 0 {
-			out = append(out, book.BookLevel{Price: float64(e.Price), Size: float64(e.Size)})
+			out = append(out, MarketWSBookLevel{Price: float64(e.Price), Size: float64(e.Size)})
 		}
 	}
 	return out
