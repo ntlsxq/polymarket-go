@@ -191,22 +191,9 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 	if err != nil {
 		return "", fmt.Errorf("sign: %w", err)
 	}
-	relayCallData, err := oc.packRelayCall(encodedFunction, gasLimit, relayAddr, nonceBig, sigBytes)
-	if err != nil {
-		return "", err
-	}
-	maxGas, relayCallGas, err := maxGuardRelayGasLimit(relayCallData)
-	if err != nil {
-		return "", err
-	}
-	if gasLimit > maxGas {
-		return "", fmt.Errorf("estimated relay gas %d exceeds RelayHub guard max %d", gasLimit, maxGas)
-	}
 	log.Debug().
 		Uint64("estimate", est).
 		Uint64("gasLimit", gasLimit).
-		Uint64("guardMax", maxGas).
-		Uint64("relayCallGas", relayCallGas).
 		Int("ops", len(calls)).
 		Msg("[ONCHAIN] gas_estimated")
 
