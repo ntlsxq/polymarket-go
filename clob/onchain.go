@@ -229,7 +229,7 @@ func (oc *OnChainClient) packSplitMerge(method, conditionId string, amount int, 
 	copy(condID[32-len(condBytes):], condBytes)
 	amountBig := big.NewInt(int64(amount))
 
-	target := oc.ctfAddr
+	target := oc.ctfCollateralAdapterAddr
 	if negRisk {
 		target = oc.negRiskCollateralAdapterAddr
 	}
@@ -252,7 +252,7 @@ func (oc *OnChainClient) packRedeem(conditionId string) (common.Address, []byte,
 	copy(condID[32-len(condBytes):], condBytes)
 
 	calldata, err := ctfABI.Pack("redeemPositions", oc.collateralAddr, parentCollectionIDZero, condID, BinaryPartition)
-	return oc.ctfAddr, calldata, err
+	return oc.ctfCollateralAdapterAddr, calldata, err
 }
 
 type TxBuilder struct {
@@ -326,7 +326,7 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 	if b.err != nil {
 		return b
 	}
-	spender := b.oc.ctfAddr
+	spender := b.oc.ctfCollateralAdapterAddr
 	if negRisk {
 		spender = b.oc.negRiskCollateralAdapterAddr
 	}
@@ -339,14 +339,16 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 	}
 	b.ops = append(b.ops, txOp{b.oc.collateralAddr, calldata})
 
+	operator := b.oc.ctfCollateralAdapterAddr
 	if negRisk {
-		cd, err := ctfABI.Pack("setApprovalForAll", b.oc.negRiskCollateralAdapterAddr, true)
-		if err != nil {
-			b.err = err
-			return b
-		}
-		b.ops = append(b.ops, txOp{b.oc.ctfAddr, cd})
+		operator = b.oc.negRiskCollateralAdapterAddr
 	}
+	cd, err := ctfABI.Pack("setApprovalForAll", operator, true)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	b.ops = append(b.ops, txOp{b.oc.ctfAddr, cd})
 	return b
 }
 
@@ -399,18 +401,19 @@ func (oc *OnChainClient) EnsureApprovalForSplit(ctx context.Context, negRisk boo
 	if negRisk {
 		return oc.EnsureApproval(ctx, oc.negRiskCollateralAdapterAddr)
 	}
-	return oc.EnsureApproval(ctx, oc.ctfAddr)
+	return oc.EnsureApproval(ctx, oc.ctfCollateralAdapterAddr)
 }
 
 type ApprovalState struct {
 	ProxyWallet                common.Address
 	StandardCollateralApproved bool
+	StandardCTFApproved        bool
 	NegRiskCollateralApproved  bool
 	NegRiskCTFApproved         bool
 }
 
 func (s ApprovalState) StandardReady() bool {
-	return s.StandardCollateralApproved
+	return s.StandardCollateralApproved && s.StandardCTFApproved
 }
 
 func (s ApprovalState) NegRiskReady() bool {
@@ -419,9 +422,13 @@ func (s ApprovalState) NegRiskReady() bool {
 
 func (oc *OnChainClient) CheckApprovals(ctx context.Context) (ApprovalState, error) {
 	proxyWallet := deriveProxyWallet(oc.fromAddr)
-	standard, err := oc.hasMaxCollateralAllowance(ctx, proxyWallet, oc.ctfAddr)
+	standard, err := oc.hasMaxCollateralAllowance(ctx, proxyWallet, oc.ctfCollateralAdapterAddr)
 	if err != nil {
 		return ApprovalState{}, fmt.Errorf("check standard collateral allowance: %w", err)
+	}
+	standardCTF, err := oc.hasCTFApprovalForAll(ctx, proxyWallet, oc.ctfCollateralAdapterAddr)
+	if err != nil {
+		return ApprovalState{}, fmt.Errorf("check standard ctf approval: %w", err)
 	}
 	negCollateral, err := oc.hasMaxCollateralAllowance(ctx, proxyWallet, oc.negRiskCollateralAdapterAddr)
 	if err != nil {
@@ -434,6 +441,7 @@ func (oc *OnChainClient) CheckApprovals(ctx context.Context) (ApprovalState, err
 	return ApprovalState{
 		ProxyWallet:                proxyWallet,
 		StandardCollateralApproved: standard,
+		StandardCTFApproved:        standardCTF,
 		NegRiskCollateralApproved:  negCollateral,
 		NegRiskCTFApproved:         negCTF,
 	}, nil

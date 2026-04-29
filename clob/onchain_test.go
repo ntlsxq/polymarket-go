@@ -7,15 +7,15 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-func TestPackSplitMergeUsesPUSDAsCollateral(t *testing.T) {
+func TestPackSplitMergeUsesPUSDCollateralAdapter(t *testing.T) {
 	oc := newTestOnChainClient(t)
 
 	target, calldata, err := oc.packSplitMerge("splitPosition", "0x624ce52f1aa210d37e00578591aa41843dc5322d76626397631eb739f4715731", 5_000_000, false)
 	if err != nil {
 		t.Fatalf("packSplitMerge: %v", err)
 	}
-	if target != common.HexToAddress(CTFAddr) {
-		t.Fatalf("target=%s want %s", target.Hex(), CTFAddr)
+	if target != common.HexToAddress(CtfCollateralAdapterAddr) {
+		t.Fatalf("target=%s want %s", target.Hex(), CtfCollateralAdapterAddr)
 	}
 
 	args, err := ctfABI.Methods["splitPosition"].Inputs.Unpack(calldata[4:])
@@ -98,6 +98,33 @@ func TestTxBuilderApproveNegRiskUsesCollateralAdapter(t *testing.T) {
 	}
 }
 
+func TestTxBuilderApproveStandardUsesCollateralAdapter(t *testing.T) {
+	oc := newTestOnChainClient(t)
+
+	tx := oc.NewTx().Approve(false)
+	if tx.err != nil {
+		t.Fatalf("Approve: %v", tx.err)
+	}
+	if len(tx.ops) != 2 {
+		t.Fatalf("ops=%d want 2", len(tx.ops))
+	}
+	approveArgs, err := erc20ApproveABI.Methods["approve"].Inputs.Unpack(tx.ops[0].calldata[4:])
+	if err != nil {
+		t.Fatalf("unpack approve: %v", err)
+	}
+	if got, want := approveArgs[0].(common.Address), common.HexToAddress(CtfCollateralAdapterAddr); got != want {
+		t.Fatalf("spender=%s want %s", got.Hex(), want.Hex())
+	}
+
+	approvalArgs, err := ctfABI.Methods["setApprovalForAll"].Inputs.Unpack(tx.ops[1].calldata[4:])
+	if err != nil {
+		t.Fatalf("unpack setApprovalForAll: %v", err)
+	}
+	if got, want := approvalArgs[0].(common.Address), common.HexToAddress(CtfCollateralAdapterAddr); got != want {
+		t.Fatalf("operator=%s want %s", got.Hex(), want.Hex())
+	}
+}
+
 func TestPackRedeemUsesPUSDAsCollateral(t *testing.T) {
 	oc := newTestOnChainClient(t)
 
@@ -105,8 +132,8 @@ func TestPackRedeemUsesPUSDAsCollateral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("packRedeem: %v", err)
 	}
-	if target != common.HexToAddress(CTFAddr) {
-		t.Fatalf("target=%s want %s", target.Hex(), CTFAddr)
+	if target != common.HexToAddress(CtfCollateralAdapterAddr) {
+		t.Fatalf("target=%s want %s", target.Hex(), CtfCollateralAdapterAddr)
 	}
 
 	args, err := ctfABI.Methods["redeemPositions"].Inputs.Unpack(calldata[4:])
