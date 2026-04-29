@@ -313,7 +313,7 @@ func (oc *OnChainClient) preflightProxyTxBatch(ctx context.Context, calls []prox
 		ProxyWallet:          deriveProxyWallet(oc.fromAddr).Hex(),
 		Relay:                relayAddr.Hex(),
 		Nonce:                nonce,
-		OuterGasLimit:        oc.relayerOuterGasLimit,
+		OuterGasLimit:        oc.effectiveRelayerOuterGasLimit(),
 		EncodedFunctionBytes: len(encodedFunction),
 	}
 
@@ -336,11 +336,19 @@ func (oc *OnChainClient) preflightProxyTxBatch(ctx context.Context, calls []prox
 		return nil, err
 	}
 	report.RelayCallBytes = len(relayCallData)
-	maxGas, intrinsic, err := maxGuardRelayGasLimit(relayCallData, oc.relayerOuterGasLimit)
-	if err == nil {
-		report.RelayCallIntrinsicGas = intrinsic
-		report.ApproxMaxSignedGas = maxGas
-		report.ApproxGuardHeadroom = int64(maxGas) - int64(gasLimit)
+	maxGas, intrinsic, err := maxGuardRelayGasLimit(relayCallData, report.OuterGasLimit)
+	report.RelayCallIntrinsicGas = intrinsic
+	report.ApproxMaxSignedGas = maxGas
+	report.ApproxGuardHeadroom = int64(maxGas) - int64(gasLimit)
+	if err != nil {
+		return nil, &RelayerError{Kind: ErrBatchTooLarge, Report: &report, Err: err}
+	}
+	if gasLimit > maxGas {
+		return nil, &RelayerError{
+			Kind:   ErrBatchTooLarge,
+			Report: &report,
+			Err:    fmt.Errorf("signed gas limit %d exceeds RelayHub guard max %d", gasLimit, maxGas),
+		}
 	}
 	if err := oc.simulateRelayHubGuard(ctx, relayAddr, relayCallData, &report); err != nil {
 		return nil, err
@@ -421,15 +429,12 @@ func (oc *OnChainClient) fetchRelayPayload(ctx context.Context) (common.Address,
 }
 
 func (oc *OnChainClient) simulateRelayHubGuard(ctx context.Context, relayAddr common.Address, relayCallData []byte, report *TxPreflightReport) error {
-	if oc.relayerOuterGasLimit == 0 {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_, err := oc.eth.CallContract(ctx, ethereum.CallMsg{
 		From:     relayAddr,
 		To:       &oc.relayHub,
-		Gas:      oc.relayerOuterGasLimit,
+		Gas:      oc.effectiveRelayerOuterGasLimit(),
 		GasPrice: big.NewInt(0),
 		Data:     relayCallData,
 	}, nil)
@@ -454,10 +459,7 @@ func relayerGasMargin(estimate uint64) uint64 {
 }
 
 func (oc *OnChainClient) signMaxGuardRelay(encodedFunction []byte, relayAddr common.Address, nonceBig *big.Int) (uint64, []byte, uint64, error) {
-	outerGasLimit := oc.relayerOuterGasLimit
-	if outerGasLimit == 0 {
-		outerGasLimit = defaultRelayerOuterGasLimit
-	}
+	outerGasLimit := oc.effectiveRelayerOuterGasLimit()
 	gasLimit := uint64(outerGasLimit - relayHubGuardReserveGas - relayHubPreGuardGas - txBaseGas)
 	var bestGas uint64
 	var bestSig []byte

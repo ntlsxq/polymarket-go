@@ -214,6 +214,13 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 	}, nil
 }
 
+func (oc *OnChainClient) effectiveRelayerOuterGasLimit() uint64 {
+	if oc.relayerOuterGasLimit != 0 {
+		return oc.relayerOuterGasLimit
+	}
+	return defaultRelayerOuterGasLimit
+}
+
 func (oc *OnChainClient) Close() {
 	if oc.eth != nil {
 		oc.eth.Close()

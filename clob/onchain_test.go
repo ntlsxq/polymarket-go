@@ -163,6 +163,21 @@ func TestMaxGuardRelayGasLimit(t *testing.T) {
 	}
 }
 
+func TestMaxGuardRelayGasLimitRejectsOversizedCalldata(t *testing.T) {
+	data := make([]byte, defaultRelayerOuterGasLimit)
+	_, _, err := maxGuardRelayGasLimit(data, defaultRelayerOuterGasLimit)
+	if err == nil {
+		t.Fatalf("expected oversized calldata to exceed RelayHub guard")
+	}
+}
+
+func TestEffectiveRelayerOuterGasLimitDefaults(t *testing.T) {
+	oc := newTestOnChainClient(t)
+	if got := oc.effectiveRelayerOuterGasLimit(); got != defaultRelayerOuterGasLimit {
+		t.Fatalf("outer gas=%d want %d", got, defaultRelayerOuterGasLimit)
+	}
+}
+
 func TestRelayerGasMarginUsesMinimumForSmallEstimates(t *testing.T) {
 	if got := relayerGasMargin(100_000); got != relayerGasMarginMin {
 		t.Fatalf("margin=%d want %d", got, relayerGasMarginMin)
