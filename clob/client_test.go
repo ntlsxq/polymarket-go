@@ -88,6 +88,58 @@ func TestBuildOrderCarriesGTDExpirationOutsideSignature(t *testing.T) {
 	}
 }
 
+func TestBuildOrderWithDeterministicIDIsStable(t *testing.T) {
+	c, err := NewClient(ClobHost, "0101010101010101010101010101010101010101010101010101010101010101", 137, 0, "")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	build := func() PostOrderArg {
+		arg, err := c.BuildOrder(context.Background(), "71321045679252212594626385532706912750332728571942532289631379312455583992563", 0.55, 10,
+			WithBuy(),
+			WithMarket("0.01", false),
+			AsGTC(),
+			WithDeterministicID("grid:v1:test"),
+		)
+		if err != nil {
+			t.Fatalf("build order: %v", err)
+		}
+		return arg
+	}
+
+	a := build()
+	b := build()
+	if a.Order.Order.Salt.Cmp(b.Order.Order.Salt) != 0 {
+		t.Fatalf("salt mismatch: %s != %s", a.Order.Order.Salt, b.Order.Order.Salt)
+	}
+	if a.Order.Order.Timestamp.Cmp(b.Order.Order.Timestamp) != 0 {
+		t.Fatalf("timestamp mismatch: %s != %s", a.Order.Order.Timestamp, b.Order.Order.Timestamp)
+	}
+	if a.Order.Signature != b.Order.Signature {
+		t.Fatalf("signature mismatch:\n  %s\n  %s", a.Order.Signature, b.Order.Signature)
+	}
+}
+
+func TestBuildOrderWithTimestampMillis(t *testing.T) {
+	c, err := NewClient(ClobHost, "0101010101010101010101010101010101010101010101010101010101010101", 137, 0, "")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	arg, err := c.BuildOrder(context.Background(), "71321045679252212594626385532706912750332728571942532289631379312455583992563", 0.55, 10,
+		WithBuy(),
+		WithMarket("0.01", false),
+		AsGTC(),
+		WithTimestampMillis(1713398400000),
+	)
+	if err != nil {
+		t.Fatalf("build order: %v", err)
+	}
+	if got := arg.Order.Order.Timestamp.String(); got != "1713398400000" {
+		t.Fatalf("timestamp=%s want 1713398400000", got)
+	}
+}
+
 // TestComputeOrderAmountsFloorsSize asserts the fast path floors size to
 // rc.Size decimals just like decimal.Floor — a half-cent excess on the
 // input must not bleed into the on-chain amounts.

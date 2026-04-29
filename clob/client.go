@@ -187,6 +187,7 @@ type OrderOption func(*orderOpts)
 
 type orderOpts struct {
 	id                string
+	timestamp         *big.Int
 	side              string
 	tickSize          string
 	negRisk           bool
@@ -204,6 +205,20 @@ type orderOpts struct {
 
 func WithID(id string) OrderOption {
 	return func(o *orderOpts) { o.id = id }
+}
+
+// WithDeterministicID derives both salt and timestamp from id. Use it
+// for idempotent order placement across stateless replicas: identical
+// order inputs + identical id produce the same signed order hash.
+func WithDeterministicID(id string) OrderOption {
+	return func(o *orderOpts) {
+		o.id = id
+		o.timestamp = timestampFromID(id)
+	}
+}
+
+func WithTimestampMillis(ts int64) OrderOption {
+	return func(o *orderOpts) { o.timestamp = big.NewInt(ts) }
 }
 
 func WithBuy() OrderOption  { return func(o *orderOpts) { o.side = SideBuy } }
@@ -334,6 +349,10 @@ func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size flo
 	if oo.id != "" {
 		salt = saltFromID(oo.id)
 	}
+	timestamp := oo.timestamp
+	if timestamp == nil {
+		timestamp = big.NewInt(time.Now().UnixMilli())
+	}
 
 	order := OrderData{
 		Salt:          salt,
@@ -344,7 +363,7 @@ func (c *Client) BuildOrder(ctx context.Context, tokenID string, price, size flo
 		TakerAmount:   big.NewInt(takerAmt),
 		Side:          orderSide,
 		SignatureType: c.sigType,
-		Timestamp:     big.NewInt(time.Now().UnixMilli()),
+		Timestamp:     new(big.Int).Set(timestamp),
 		Metadata:      oo.metadata,
 		Builder:       oo.builder,
 	}

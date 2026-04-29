@@ -293,3 +293,13 @@ func saltFromID(id string) *big.Int {
 	n := new(big.Int).SetBytes(h[:8])
 	return n.And(n, big.NewInt(0x7fffffffffffffff))
 }
+
+func timestampFromID(id string) *big.Int {
+	h := keccak256([]byte("timestamp:" + id))
+	n := new(big.Int).SetBytes(h[:8])
+	// Keep generated timestamps in a stable, bounded V2-era range. The
+	// timestamp is part of order uniqueness, not expiry.
+	const baseMillis int64 = 1713398400000
+	const rangeMillis int64 = 2 * 365 * 24 * 60 * 60 * 1000
+	return big.NewInt(baseMillis + int64(n.Uint64()%uint64(rangeMillis)))
+}
