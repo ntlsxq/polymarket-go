@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/goccy/go-json"
 	"io"
@@ -12,10 +13,54 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/rs/zerolog/log"
 )
+
+var (
+	ErrBatchTooLarge          = errors.New("relayer batch too large")
+	ErrRelayerGuardGas        = errors.New("relayer guard gas")
+	ErrEstimateReverted       = errors.New("relayer estimate reverted")
+	ErrInnerRelayedCallFailed = errors.New("relayer inner call failed")
+	ErrRelayerRateLimited     = errors.New("relayer rate limited")
+)
+
+type RelayerError struct {
+	Kind   error
+	Report *TxPreflightReport
+	Err    error
+}
+
+func (e *RelayerError) Error() string {
+	if e == nil {
+		return ""
+	}
+	msg := e.Kind.Error()
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	if e.Report != nil {
+		msg += fmt.Sprintf(" (ops=%d estimate=%d signed_gas=%d outer_gas=%d approx_max=%d guard_headroom=%d)",
+			e.Report.Ops,
+			e.Report.InnerGasEstimate,
+			e.Report.SignedGasLimit,
+			e.Report.OuterGasLimit,
+			e.Report.ApproxMaxSignedGas,
+			e.Report.ApproxGuardHeadroom,
+		)
+	}
+	return msg
+}
+
+func (e *RelayerError) Unwrap() error {
+	return e.Err
+}
+
+func (e *RelayerError) Is(target error) bool {
+	return target == e.Kind || errors.Is(e.Err, target)
+}
 
 func (oc *OnChainClient) WaitForConfirmed(ctx context.Context, txID string) (*TxResult, error) {
 	ticker := time.NewTicker(250 * time.Millisecond)
@@ -35,13 +80,15 @@ func (oc *OnChainClient) WaitForConfirmed(ctx context.Context, txID string) (*Tx
 				continue
 			}
 			if result.Status == 0 {
+				oc.fillTxResult(ctx, result)
 				if result.ErrorMsg != "" {
-					return result, fmt.Errorf("tx %s (hash %s) failed: %s", txID, result.TxHash, result.ErrorMsg)
+					return result, classifyRelayerFailure(result, fmt.Errorf("tx %s (hash %s) failed: %s", txID, result.TxHash, result.ErrorMsg))
 				}
-				return result, fmt.Errorf("tx %s (hash %s) reverted", txID, result.TxHash)
+				return result, classifyRelayerFailure(result, fmt.Errorf("tx %s (hash %s) reverted", txID, result.TxHash))
 			}
 
 			if state == "CONFIRMED" {
+				oc.fillTxResult(ctx, result)
 				log.Info().Str("txID", txID).Str("tx", result.TxHash).Str("state", state).Msg("[ONCHAIN] confirmed")
 				return result, nil
 			}
@@ -102,11 +149,45 @@ func (oc *OnChainClient) pollTransaction(ctx context.Context, path string) (*TxR
 	state := strings.TrimPrefix(strings.ToUpper(tx.State), "STATE_")
 	switch state {
 	case "EXECUTED", "CONFIRMED", "MINED":
-		return &TxResult{TxHash: tx.TxHash, Status: 1}, state, nil
+		return &TxResult{TxHash: tx.TxHash, RelayerState: state, Status: 1}, state, nil
 	case "FAILED", "INVALID":
-		return &TxResult{TxHash: tx.TxHash, Status: 0, ErrorMsg: tx.ErrorMsg}, state, nil
+		return &TxResult{TxHash: tx.TxHash, RelayerState: state, Status: 0, ErrorMsg: tx.ErrorMsg}, state, nil
 	default:
 		return nil, "", nil
+	}
+}
+
+func (oc *OnChainClient) fillTxResult(ctx context.Context, result *TxResult) {
+	if result == nil || result.TxHash == "" || oc.eth == nil {
+		return
+	}
+	hash := common.HexToHash(result.TxHash)
+	receipt, err := oc.eth.TransactionReceipt(ctx, hash)
+	if err == nil && receipt != nil {
+		result.Status = receipt.Status
+		result.GasUsed = receipt.GasUsed
+	}
+	tx, _, err := oc.eth.TransactionByHash(ctx, hash)
+	if err == nil && tx != nil {
+		result.GasLimit = tx.Gas()
+	}
+}
+
+func classifyRelayerFailure(result *TxResult, err error) error {
+	msg := ""
+	if result != nil {
+		msg = strings.ToLower(result.ErrorMsg)
+	}
+	errMsg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "not enough gasleft") || strings.Contains(errMsg, "not enough gasleft"):
+		return &RelayerError{Kind: ErrRelayerGuardGas, Err: err}
+	case strings.Contains(msg, "internal transaction failure") ||
+		strings.Contains(msg, "captured a revert") ||
+		(result != nil && result.Status == 1):
+		return &RelayerError{Kind: ErrInnerRelayedCallFailed, Err: err}
+	default:
+		return err
 	}
 }
 
@@ -137,75 +218,151 @@ type relayerSubmitBody struct {
 	SignatureParams relayerSignatureParams `json:"signatureParams"`
 }
 
+type proxyRelayRequest struct {
+	encodedFunction []byte
+	relayCallData   []byte
+	body            relayerSubmitBody
+	report          TxPreflightReport
+}
+
 func (oc *OnChainClient) sendProxyTx(ctx context.Context, target common.Address, calldata []byte) (string, error) {
 	return oc.sendProxyTxBatch(ctx, []proxyCallArg{{callTypeCall, target, big.NewInt(0), calldata}})
 }
 
 func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCallArg) (string, error) {
+	res, err := oc.sendProxyTxBatchWithReport(ctx, calls)
+	if err != nil {
+		return "", err
+	}
+	return res.TxID, nil
+}
+
+func (oc *OnChainClient) sendProxyTxBatchWithReport(ctx context.Context, calls []proxyCallArg) (*TxSendResult, error) {
 	if ctx.Err() != nil {
-		return "", ctx.Err()
+		return nil, ctx.Err()
 	}
 
+	req, err := oc.preflightProxyTxBatch(ctx, calls)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyBytes, _ := json.Marshal(req.body)
+	log.Debug().RawJSON("body", bodyBytes).Msg("[RELAYER] submit")
+
+	subReq, err := http.NewRequestWithContext(ctx, "POST", relayerURL+"/submit", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create submit request: %w", err)
+	}
+	subReq.Header.Set("Content-Type", "application/json")
+	subReq.Header.Set("RELAYER_API_KEY", oc.relayerAPIKey)
+	subReq.Header.Set("RELAYER_API_KEY_ADDRESS", strings.ToLower(oc.fromAddr.Hex()))
+
+	subResp, err := oc.relayerClient.Do(subReq)
+	if err != nil {
+		return nil, fmt.Errorf("submit: %w", err)
+	}
+	defer subResp.Body.Close()
+	respBody, err := io.ReadAll(subResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read submit body: %w", err)
+	}
+
+	if subResp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RelayerError{Kind: ErrRelayerRateLimited, Report: &req.report, Err: fmt.Errorf("submit %d: %s", subResp.StatusCode, string(respBody))}
+	}
+	if subResp.StatusCode != 200 && subResp.StatusCode != 201 {
+		return nil, fmt.Errorf("submit %d: %s", subResp.StatusCode, string(respBody))
+	}
+
+	var sr struct {
+		TransactionID string `json:"transactionID"`
+		TxHash        string `json:"transactionHash"`
+	}
+	if err := json.Unmarshal(respBody, &sr); err != nil {
+		return nil, fmt.Errorf("parse submit response: %w", err)
+	}
+	txID := sr.TransactionID
+	if txID == "" {
+		txID = sr.TxHash
+	}
+	if txID == "" {
+		return nil, fmt.Errorf("no transaction ID: %s", string(respBody))
+	}
+
+	log.Debug().Str("txID", txID).Msg("[ONCHAIN] relayer_ok")
+	return &TxSendResult{TxID: txID, Preflight: req.report}, nil
+}
+
+func (oc *OnChainClient) preflightProxyTxBatch(ctx context.Context, calls []proxyCallArg) (*proxyRelayRequest, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	encodedFunction, err := proxyWalletFactoryABI.Pack("proxy", calls)
 	if err != nil {
-		return "", fmt.Errorf("pack proxy: %w", err)
+		return nil, fmt.Errorf("pack proxy: %w", err)
 	}
 
-	rpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/relay-payload?address=%s&type=PROXY", relayerURL, oc.fromAddr.Hex()), nil)
+	relayAddr, nonce, nonceBig, err := oc.fetchRelayPayload(ctx)
 	if err != nil {
-		return "", fmt.Errorf("create relay-payload request: %w", err)
-	}
-	rpResp, err := oc.relayerClient.Do(rpReq)
-	if err != nil {
-		return "", fmt.Errorf("relay-payload: %w", err)
-	}
-	defer rpResp.Body.Close()
-	rpBody, err := io.ReadAll(rpResp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read relay-payload body: %w", err)
-	}
-	if rpResp.StatusCode != 200 {
-		return "", fmt.Errorf("relay-payload %d: %s", rpResp.StatusCode, string(rpBody))
+		return nil, err
 	}
 
-	var rp struct {
-		Address string `json:"address"`
-		Nonce   string `json:"nonce"`
+	report := TxPreflightReport{
+		Ops:                  len(calls),
+		ProxyWallet:          deriveProxyWallet(oc.fromAddr).Hex(),
+		Relay:                relayAddr.Hex(),
+		Nonce:                nonce,
+		OuterGasLimit:        oc.relayerOuterGasLimit,
+		EncodedFunctionBytes: len(encodedFunction),
 	}
-	if err := json.Unmarshal(rpBody, &rp); err != nil {
-		return "", fmt.Errorf("parse relay-payload: %w", err)
-	}
-
-	relayAddr := common.HexToAddress(rp.Address)
-	nonceBig := new(big.Int)
-	nonceBig.SetString(rp.Nonce, 10)
-
-	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")
 
 	est, err := oc.estimateProxyGas(ctx, encodedFunction)
 	if err != nil {
-		return "", fmt.Errorf("estimate proxy gas: %w", err)
+		return nil, &RelayerError{Kind: ErrEstimateReverted, Report: &report, Err: fmt.Errorf("estimate proxy gas: %w", err)}
 	}
-	gasLimit := est + gasSlack
+	margin := relayerGasMargin(est)
+	gasLimit := est + margin
+	report.InnerGasEstimate = est
+	report.GasMargin = margin
+	report.SignedGasLimit = gasLimit
+
 	sigBytes, err := oc.signProxyRelay(encodedFunction, gasLimit, relayAddr, nonceBig)
 	if err != nil {
-		return "", fmt.Errorf("sign: %w", err)
+		return nil, fmt.Errorf("sign: %w", err)
 	}
+	relayCallData, err := oc.packRelayCall(encodedFunction, gasLimit, relayAddr, nonceBig, sigBytes)
+	if err != nil {
+		return nil, err
+	}
+	report.RelayCallBytes = len(relayCallData)
+	maxGas, intrinsic, err := maxGuardRelayGasLimit(relayCallData, oc.relayerOuterGasLimit)
+	if err == nil {
+		report.RelayCallIntrinsicGas = intrinsic
+		report.ApproxMaxSignedGas = maxGas
+		report.ApproxGuardHeadroom = int64(maxGas) - int64(gasLimit)
+	}
+	if err := oc.simulateRelayHubGuard(ctx, relayAddr, relayCallData, &report); err != nil {
+		return nil, err
+	}
+
 	log.Debug().
 		Uint64("estimate", est).
+		Uint64("margin", margin).
 		Uint64("gasLimit", gasLimit).
+		Uint64("outerGasLimit", report.OuterGasLimit).
+		Int64("approxGuardHeadroom", report.ApproxGuardHeadroom).
 		Int("ops", len(calls)).
-		Msg("[ONCHAIN] gas_estimated")
+		Msg("[ONCHAIN] gas_preflight")
 
-	proxyWallet := deriveProxyWallet(oc.fromAddr)
-	submitBody := relayerSubmitBody{
+	body := relayerSubmitBody{
 		Type:        "PROXY",
 		From:        strings.ToLower(oc.fromAddr.Hex()),
 		To:          strings.ToLower(oc.factoryAddr.Hex()),
-		ProxyWallet: strings.ToLower(proxyWallet.Hex()),
+		ProxyWallet: strings.ToLower(report.ProxyWallet),
 		Data:        "0x" + hex.EncodeToString(encodedFunction),
 		Value:       "0",
-		Nonce:       rp.Nonce,
+		Nonce:       nonce,
 		Signature:   "0x" + hex.EncodeToString(sigBytes),
 		SignatureParams: relayerSignatureParams{
 			GasPrice:   "0",
@@ -216,52 +373,92 @@ func (oc *OnChainClient) sendProxyTxBatch(ctx context.Context, calls []proxyCall
 		},
 	}
 
-	bodyBytes, _ := json.Marshal(submitBody)
-	log.Debug().RawJSON("body", bodyBytes).Msg("[RELAYER] submit")
+	return &proxyRelayRequest{
+		encodedFunction: encodedFunction,
+		relayCallData:   relayCallData,
+		body:            body,
+		report:          report,
+	}, nil
+}
 
-	subReq, err := http.NewRequestWithContext(ctx, "POST", relayerURL+"/submit", bytes.NewReader(bodyBytes))
+func (oc *OnChainClient) fetchRelayPayload(ctx context.Context) (common.Address, string, *big.Int, error) {
+	rpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/relay-payload?address=%s&type=PROXY", relayerURL, oc.fromAddr.Hex()), nil)
 	if err != nil {
-		return "", fmt.Errorf("create submit request: %w", err)
+		return common.Address{}, "", nil, fmt.Errorf("create relay-payload request: %w", err)
 	}
-	subReq.Header.Set("Content-Type", "application/json")
-	subReq.Header.Set("RELAYER_API_KEY", oc.relayerAPIKey)
-	subReq.Header.Set("RELAYER_API_KEY_ADDRESS", strings.ToLower(oc.fromAddr.Hex()))
-
-	subResp, err := oc.relayerClient.Do(subReq)
+	rpResp, err := oc.relayerClient.Do(rpReq)
 	if err != nil {
-		return "", fmt.Errorf("submit: %w", err)
+		return common.Address{}, "", nil, fmt.Errorf("relay-payload: %w", err)
 	}
-	defer subResp.Body.Close()
-	respBody, err := io.ReadAll(subResp.Body)
+	defer rpResp.Body.Close()
+	rpBody, err := io.ReadAll(rpResp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read submit body: %w", err)
+		return common.Address{}, "", nil, fmt.Errorf("read relay-payload body: %w", err)
+	}
+	if rpResp.StatusCode != 200 {
+		if rpResp.StatusCode == http.StatusTooManyRequests {
+			return common.Address{}, "", nil, &RelayerError{Kind: ErrRelayerRateLimited, Err: fmt.Errorf("relay-payload %d: %s", rpResp.StatusCode, string(rpBody))}
+		}
+		return common.Address{}, "", nil, fmt.Errorf("relay-payload %d: %s", rpResp.StatusCode, string(rpBody))
 	}
 
-	if subResp.StatusCode != 200 && subResp.StatusCode != 201 {
-		return "", fmt.Errorf("submit %d: %s", subResp.StatusCode, string(respBody))
+	var rp struct {
+		Address string `json:"address"`
+		Nonce   string `json:"nonce"`
+	}
+	if err := json.Unmarshal(rpBody, &rp); err != nil {
+		return common.Address{}, "", nil, fmt.Errorf("parse relay-payload: %w", err)
 	}
 
-	var sr struct {
-		TransactionID string `json:"transactionID"`
-		TxHash        string `json:"transactionHash"`
-	}
-	if err := json.Unmarshal(respBody, &sr); err != nil {
-		return "", fmt.Errorf("parse submit response: %w", err)
-	}
-	txID := sr.TransactionID
-	if txID == "" {
-		txID = sr.TxHash
-	}
-	if txID == "" {
-		return "", fmt.Errorf("no transaction ID: %s", string(respBody))
+	relayAddr := common.HexToAddress(rp.Address)
+	nonceBig := new(big.Int)
+	if _, ok := nonceBig.SetString(rp.Nonce, 10); !ok {
+		return common.Address{}, "", nil, fmt.Errorf("parse relay nonce %q", rp.Nonce)
 	}
 
-	log.Debug().Str("txID", txID).Msg("[ONCHAIN] relayer_ok")
-	return txID, nil
+	log.Debug().Str("relay", relayAddr.Hex()).Str("nonce", rp.Nonce).Msg("[PROXY] relay_payload")
+	return relayAddr, rp.Nonce, nonceBig, nil
+}
+
+func (oc *OnChainClient) simulateRelayHubGuard(ctx context.Context, relayAddr common.Address, relayCallData []byte, report *TxPreflightReport) error {
+	if oc.relayerOuterGasLimit == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := oc.eth.CallContract(ctx, ethereum.CallMsg{
+		From:     relayAddr,
+		To:       &oc.relayHub,
+		Gas:      oc.relayerOuterGasLimit,
+		GasPrice: big.NewInt(0),
+		Data:     relayCallData,
+	}, nil)
+	if err == nil {
+		report.RelayHubSimulationOK = true
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	kind := ErrInnerRelayedCallFailed
+	if strings.Contains(msg, "not enough gasleft") || strings.Contains(msg, "out of gas") {
+		kind = ErrBatchTooLarge
+	}
+	return &RelayerError{Kind: kind, Report: report, Err: err}
+}
+
+func relayerGasMargin(estimate uint64) uint64 {
+	pct := estimate * relayerGasMarginBps / 10_000
+	if pct < relayerGasMarginMin {
+		return relayerGasMarginMin
+	}
+	return pct
 }
 
 func (oc *OnChainClient) signMaxGuardRelay(encodedFunction []byte, relayAddr common.Address, nonceBig *big.Int) (uint64, []byte, uint64, error) {
-	gasLimit := uint64(relayerOuterGasLimit - relayHubGuardReserveGas - relayHubPreGuardGas - txBaseGas)
+	outerGasLimit := oc.relayerOuterGasLimit
+	if outerGasLimit == 0 {
+		outerGasLimit = defaultRelayerOuterGasLimit
+	}
+	gasLimit := uint64(outerGasLimit - relayHubGuardReserveGas - relayHubPreGuardGas - txBaseGas)
 	var bestGas uint64
 	var bestSig []byte
 	var bestRelayCallGas uint64
@@ -275,7 +472,7 @@ func (oc *OnChainClient) signMaxGuardRelay(encodedFunction []byte, relayAddr com
 		if err != nil {
 			return 0, nil, 0, err
 		}
-		maxGas, relayCallGas, err := maxGuardRelayGasLimit(relayCallData)
+		maxGas, relayCallGas, err := maxGuardRelayGasLimit(relayCallData, outerGasLimit)
 		if err != nil {
 			return 0, nil, 0, err
 		}
@@ -341,13 +538,13 @@ func (oc *OnChainClient) packRelayCall(encodedFunction []byte, gasLimit uint64, 
 	)
 }
 
-func maxGuardRelayGasLimit(relayCallData []byte) (uint64, uint64, error) {
+func maxGuardRelayGasLimit(relayCallData []byte, outerGasLimit uint64) (uint64, uint64, error) {
 	relayCallGas := relayCallIntrinsicGas(relayCallData)
 	requiredBeforeUserCall := relayCallGas + relayHubGuardReserveGas + relayHubPreGuardGas
-	if requiredBeforeUserCall >= relayerOuterGasLimit {
-		return 0, relayCallGas, fmt.Errorf("relay calldata too large: intrinsic=%d guard=%d preGuard=%d outer=%d", relayCallGas, relayHubGuardReserveGas, relayHubPreGuardGas, relayerOuterGasLimit)
+	if requiredBeforeUserCall >= outerGasLimit {
+		return 0, relayCallGas, fmt.Errorf("relay calldata too large: intrinsic=%d guard=%d preGuard=%d outer=%d", relayCallGas, relayHubGuardReserveGas, relayHubPreGuardGas, outerGasLimit)
 	}
-	return relayerOuterGasLimit - requiredBeforeUserCall, relayCallGas, nil
+	return outerGasLimit - requiredBeforeUserCall, relayCallGas, nil
 }
 
 func relayCallIntrinsicGas(data []byte) uint64 {

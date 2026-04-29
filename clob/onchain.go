@@ -32,22 +32,25 @@ const (
 )
 
 const (
-	// gasSlack is a flat buffer added to eth_estimateGas output to absorb
-	// cold/warm slot drift between simulation and relayed execution.
-	gasSlack = 30_000
+	// relayerGasMarginMin and relayerGasMarginBps are added to eth_estimateGas
+	// output before signing the GSN RelayHub request. Large batches need a
+	// proportional margin; a flat buffer is too small once estimates reach
+	// millions of gas.
+	relayerGasMarginMin = 50_000
+	relayerGasMarginBps = 1_500
 
 	// Polymarket's relayer submits RelayHub transactions with a 10M outer gas
 	// limit. RelayHub's guard requires signedGasLimit + 350k reserve to fit
 	// after tx intrinsic/calldata gas and the pre-guard execution cost.
-	relayerOuterGasLimit    = 10_000_000
-	relayHubGuardReserveGas = 350_000
-	relayHubPreGuardGas     = 25_000
-	txBaseGas               = 21_000
-	txDataZeroGas           = 4
-	txDataNonZeroGas        = 16
-	maxUint256Hex           = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-	callTypeCall            = 1
-	relayerURL              = "https://relayer-v2.polymarket.com"
+	defaultRelayerOuterGasLimit = 10_000_000
+	relayHubGuardReserveGas     = 350_000
+	relayHubPreGuardGas         = 25_000
+	txBaseGas                   = 21_000
+	txDataZeroGas               = 4
+	txDataNonZeroGas            = 16
+	maxUint256Hex               = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	callTypeCall                = 1
+	relayerURL                  = "https://relayer-v2.polymarket.com"
 )
 
 const ctfABIJSON = `[
@@ -114,10 +117,33 @@ var (
 )
 
 type TxResult struct {
-	TxHash   string
-	Status   uint64
-	GasUsed  uint64
-	ErrorMsg string
+	TxHash       string
+	RelayerState string
+	Status       uint64
+	GasLimit     uint64
+	GasUsed      uint64
+	ErrorMsg     string
+}
+
+type TxPreflightReport struct {
+	Ops                   int
+	ProxyWallet           string
+	Relay                 string
+	Nonce                 string
+	OuterGasLimit         uint64
+	InnerGasEstimate      uint64
+	GasMargin             uint64
+	SignedGasLimit        uint64
+	RelayCallIntrinsicGas uint64
+	ApproxMaxSignedGas    uint64
+	ApproxGuardHeadroom   int64
+	EncodedFunctionBytes  int
+	RelayCallBytes        int
+	RelayHubSimulationOK  bool
+}
+
+func (r TxPreflightReport) FitsRelayGuard() bool {
+	return r.RelayHubSimulationOK
 }
 
 type OnChainClient struct {
@@ -133,14 +159,16 @@ type OnChainClient struct {
 	collateralAddr               common.Address
 	relayHub                     common.Address
 	relayerAPIKey                string
+	relayerOuterGasLimit         uint64
 	approvedMu                   sync.Mutex
 	approved                     map[common.Address]bool
 }
 
 type OnChainConfig struct {
-	PrivateKey    *ecdsa.PrivateKey
-	RelayerAPIKey string
-	PolygonRPC    string
+	PrivateKey           *ecdsa.PrivateKey
+	RelayerAPIKey        string
+	PolygonRPC           string
+	RelayerOuterGasLimit uint64
 }
 
 func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
@@ -161,6 +189,10 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 	}
 
 	fromAddr := crypto.PubkeyToAddress(cfg.PrivateKey.PublicKey)
+	outerGasLimit := cfg.RelayerOuterGasLimit
+	if outerGasLimit == 0 {
+		outerGasLimit = defaultRelayerOuterGasLimit
+	}
 
 	return &OnChainClient{
 		relayerClient: &http.Client{
@@ -177,6 +209,7 @@ func NewOnChainClient(cfg OnChainConfig) (*OnChainClient, error) {
 		collateralAddr:               common.HexToAddress(PUSDAddr),
 		relayHub:                     common.HexToAddress(GSNRelayHub),
 		relayerAPIKey:                cfg.RelayerAPIKey,
+		relayerOuterGasLimit:         outerGasLimit,
 		approved:                     make(map[common.Address]bool),
 	}, nil
 }
@@ -352,23 +385,56 @@ func (b *TxBuilder) Approve(negRisk bool) *TxBuilder {
 	return b
 }
 
+func (b *TxBuilder) Preflight(ctx context.Context) (*TxPreflightReport, error) {
+	calls, err := b.proxyCalls()
+	if err != nil {
+		return nil, err
+	}
+	req, err := b.oc.preflightProxyTxBatch(ctx, calls)
+	if req == nil {
+		return nil, err
+	}
+	return &req.report, err
+}
+
+type TxSendResult struct {
+	TxID      string
+	Preflight TxPreflightReport
+}
+
+func (b *TxBuilder) SendWithReport(ctx context.Context) (*TxSendResult, error) {
+	calls, err := b.proxyCalls()
+	if err != nil {
+		return nil, err
+	}
+	res, err := b.oc.sendProxyTxBatchWithReport(ctx, calls)
+	if err != nil {
+		return nil, err
+	}
+	log.Info().Int("ops", len(b.ops)).Str("tx", res.TxID).Msg("[ONCHAIN] batch_sent")
+	return res, nil
+}
+
 func (b *TxBuilder) Send(ctx context.Context) (string, error) {
+	res, err := b.SendWithReport(ctx)
+	if err != nil {
+		return "", err
+	}
+	return res.TxID, nil
+}
+
+func (b *TxBuilder) proxyCalls() ([]proxyCallArg, error) {
 	if b.err != nil {
-		return "", b.err
+		return nil, b.err
 	}
 	if len(b.ops) == 0 {
-		return "", fmt.Errorf("empty transaction")
+		return nil, fmt.Errorf("empty transaction")
 	}
 	calls := make([]proxyCallArg, len(b.ops))
 	for i, op := range b.ops {
 		calls[i] = proxyCallArg{callTypeCall, op.target, big.NewInt(0), op.calldata}
 	}
-	txID, err := b.oc.sendProxyTxBatch(ctx, calls)
-	if err != nil {
-		return "", err
-	}
-	log.Info().Int("ops", len(b.ops)).Str("tx", txID).Msg("[ONCHAIN] batch_sent")
-	return txID, nil
+	return calls, nil
 }
 
 func (oc *OnChainClient) EnsureApproval(ctx context.Context, spender common.Address) (string, error) {

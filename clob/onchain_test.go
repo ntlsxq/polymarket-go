@@ -1,6 +1,7 @@
 package clob
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -147,7 +148,7 @@ func TestPackRedeemUsesPUSDAsCollateral(t *testing.T) {
 
 func TestMaxGuardRelayGasLimit(t *testing.T) {
 	data := []byte{0x00, 0x01, 0x02, 0x00}
-	got, intrinsic, err := maxGuardRelayGasLimit(data)
+	got, intrinsic, err := maxGuardRelayGasLimit(data, defaultRelayerOuterGasLimit)
 	if err != nil {
 		t.Fatalf("maxGuardRelayGasLimit: %v", err)
 	}
@@ -156,9 +157,28 @@ func TestMaxGuardRelayGasLimit(t *testing.T) {
 	if intrinsic != wantIntrinsic {
 		t.Fatalf("intrinsic=%d want %d", intrinsic, wantIntrinsic)
 	}
-	want := uint64(relayerOuterGasLimit - wantIntrinsic - relayHubGuardReserveGas - relayHubPreGuardGas)
+	want := uint64(defaultRelayerOuterGasLimit - wantIntrinsic - relayHubGuardReserveGas - relayHubPreGuardGas)
 	if got != want {
 		t.Fatalf("gasLimit=%d want %d", got, want)
+	}
+}
+
+func TestRelayerGasMarginUsesMinimumForSmallEstimates(t *testing.T) {
+	if got := relayerGasMargin(100_000); got != relayerGasMarginMin {
+		t.Fatalf("margin=%d want %d", got, relayerGasMarginMin)
+	}
+}
+
+func TestRelayerGasMarginScalesForLargeEstimates(t *testing.T) {
+	if got, want := relayerGasMargin(8_000_000), uint64(1_200_000); got != want {
+		t.Fatalf("margin=%d want %d", got, want)
+	}
+}
+
+func TestRelayerErrorIsKind(t *testing.T) {
+	err := &RelayerError{Kind: ErrBatchTooLarge, Err: errors.New("guard failed")}
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("errors.Is did not match ErrBatchTooLarge")
 	}
 }
 
