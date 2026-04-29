@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	gammaAPI      = "https://gamma-api.polymarket.com"
-	maxPages      = 6
-	retryAttempts = 3
+	gammaAPI              = "https://gamma-api.polymarket.com"
+	maxPages              = 6
+	retryAttempts         = 3
+	defaultScanDaysAhead  = 7
+	directScanConcurrency = 8
 )
 
 func LogRTT() {
@@ -100,25 +103,31 @@ type gammaEvent struct {
 }
 
 // ScanMarkets queries Polymarket's Gamma API and returns markets matching
-// the given coins and dates. Pass nil for dates to include all dates.
-// Pass an empty coins slice to include none; typical usage is to pass
-// AllCoins or a subset.
+// the given coins and dates. Pass nil for dates to scan today's ET date
+// through the next week, matching Polymarket's rolling daily crypto markets.
+// Pass an empty coins slice to include none; typical usage is to pass AllCoins
+// or a subset.
 func ScanMarkets(coins, dates []string) ([]Market, error) {
 	coinSet := make(map[string]struct{}, len(coins))
 	for _, c := range coins {
 		coinSet[c] = struct{}{}
 	}
 
+	scanDates := dates
+	if scanDates == nil {
+		scanDates = upcomingDateStrings(time.Now().In(et), defaultScanDaysAhead)
+	}
+
 	var dateSet map[string]struct{}
-	if dates != nil {
-		dateSet = make(map[string]struct{}, len(dates))
-		for _, d := range dates {
+	if scanDates != nil {
+		dateSet = make(map[string]struct{}, len(scanDates))
+		for _, d := range scanDates {
 			dateSet[d] = struct{}{}
 		}
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	events, err := fetchEvents(client)
+	events, source, slugCount, err := fetchScanEvents(client, coins, scanDates)
 	if err != nil {
 		return nil, err
 	}
@@ -219,13 +228,157 @@ func ScanMarkets(coins, dates []string) ([]Market, error) {
 		}
 	}
 	feeLog := log.Info().Int("markets", len(result)).Int("events", len(events)).
-		Int("dynamic_fee_rates", dynamicFeeCount)
+		Int("dynamic_fee_rates", dynamicFeeCount).
+		Str("source", source).
+		Int("slugs", slugCount)
 	for rate, count := range feeRates {
 		feeLog = feeLog.Int(fmt.Sprintf("fee_%.4f", rate), count)
 	}
 	feeLog.Msg("[SCAN] done")
 
 	return result, nil
+}
+
+func fetchScanEvents(client *http.Client, coins, dates []string) ([]gammaEvent, string, int, error) {
+	slugs := scanEventSlugs(coins, dates)
+	if len(slugs) > 0 {
+		events, err := fetchEventsBySlugs(client, slugs)
+		if err == nil && len(events) > 0 {
+			return events, "slug", len(slugs), nil
+		}
+		log.Warn().
+			Err(err).
+			Int("slugs", len(slugs)).
+			Int("events", len(events)).
+			Msg("[SCAN] direct slug scan empty; falling back to broad crypto scan")
+	}
+
+	events, err := fetchEvents(client)
+	return events, "broad", len(slugs), err
+}
+
+func scanEventSlugs(coins, dates []string) []string {
+	if len(coins) == 0 || len(dates) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(coins)*len(dates)*2)
+	seen := make(map[string]struct{}, len(coins)*len(dates)*2)
+	for _, coin := range coins {
+		coin = strings.TrimSpace(coin)
+		if coin == "" {
+			continue
+		}
+		for _, date := range dates {
+			date = strings.TrimSpace(date)
+			if date == "" {
+				continue
+			}
+			for _, slug := range []string{
+				fmt.Sprintf("%s-above-on-%s", coin, date),
+				fmt.Sprintf("%s-price-on-%s", coin, date),
+			} {
+				if _, ok := seen[slug]; ok {
+					continue
+				}
+				seen[slug] = struct{}{}
+				out = append(out, slug)
+			}
+		}
+	}
+	return out
+}
+
+func upcomingDateStrings(now time.Time, daysAhead int) []string {
+	if daysAhead < 0 {
+		daysAhead = 0
+	}
+	out := make([]string, 0, daysAhead+1)
+	for i := 0; i <= daysAhead; i++ {
+		day := now.AddDate(0, 0, i)
+		out = append(out, fmt.Sprintf("%s-%d", strings.ToLower(day.Month().String()), day.Day()))
+	}
+	return out
+}
+
+func fetchEventsBySlugs(client *http.Client, slugs []string) ([]gammaEvent, error) {
+	type job struct {
+		idx  int
+		slug string
+	}
+	type result struct {
+		idx    int
+		slug   string
+		events []gammaEvent
+		err    error
+	}
+	jobs := make(chan job)
+	results := make(chan result, len(slugs))
+	workers := directScanConcurrency
+	if workers > len(slugs) {
+		workers = len(slugs)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				events, err := fetchEventsBySlug(client, j.slug)
+				results <- result{idx: j.idx, slug: j.slug, events: events, err: err}
+			}
+		}()
+	}
+
+	for i, slug := range slugs {
+		jobs <- job{idx: i, slug: slug}
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	bySlugIndex := make([][]gammaEvent, len(slugs))
+	for res := range results {
+		if res.err != nil {
+			return nil, fmt.Errorf("fetch event slug %s: %w", res.slug, res.err)
+		}
+		bySlugIndex[res.idx] = res.events
+	}
+
+	var all []gammaEvent
+	seen := make(map[string]struct{}, len(slugs))
+	for _, events := range bySlugIndex {
+		for _, ev := range events {
+			if ev.Slug != "" {
+				if _, ok := seen[ev.Slug]; ok {
+					continue
+				}
+				seen[ev.Slug] = struct{}{}
+			}
+			all = append(all, ev)
+		}
+	}
+	return all, nil
+}
+
+func fetchEventsBySlug(client *http.Client, slug string) ([]gammaEvent, error) {
+	endpoint := fmt.Sprintf("%s/events?slug=%s", gammaAPI, url.QueryEscape(slug))
+	body, err := httpGet(client, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	var batch []gammaEvent
+	if err := json.Unmarshal(body, &batch); err == nil {
+		return batch, nil
+	}
+	var single gammaEvent
+	if err := json.Unmarshal(body, &single); err != nil {
+		return nil, err
+	}
+	if single.Slug == "" {
+		return nil, nil
+	}
+	return []gammaEvent{single}, nil
 }
 
 func fetchEvents(client *http.Client) ([]gammaEvent, error) {
