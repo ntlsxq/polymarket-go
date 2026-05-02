@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,29 +72,56 @@ func LogRTT() {
 }
 
 type GammaFeeSchedule struct {
-	FeeRate float64 `json:"feeRate"`
+	FeeRate    float64 `json:"feeRate"`
+	Rate       string  `json:"rate"`
+	Exponent   string  `json:"exponent"`
+	TakerOnly  bool    `json:"takerOnly"`
+	RebateRate string  `json:"rebateRate"`
 }
 
 func (s *GammaFeeSchedule) UnmarshalJSON(raw []byte) error {
 	var in struct {
-		FeeRate flexFloat `json:"feeRate"`
+		FeeRate    *flexString `json:"feeRate"`
+		Rate       *flexString `json:"rate"`
+		Exponent   *flexString `json:"exponent"`
+		TakerOnly  bool        `json:"takerOnly"`
+		RebateRate *flexString `json:"rebateRate"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return err
 	}
-	s.FeeRate = float64(in.FeeRate)
+	if in.Rate != nil {
+		s.Rate = string(*in.Rate)
+	} else if in.FeeRate != nil {
+		s.Rate = string(*in.FeeRate)
+	}
+	if s.Rate != "" {
+		if rate, err := strconv.ParseFloat(s.Rate, 64); err == nil {
+			s.FeeRate = rate
+		}
+	}
+	if in.Exponent != nil {
+		s.Exponent = string(*in.Exponent)
+	} else if in.FeeRate != nil {
+		s.Exponent = "1"
+	}
+	s.TakerOnly = in.TakerOnly
+	if in.RebateRate != nil {
+		s.RebateRate = string(*in.RebateRate)
+	}
 	return nil
 }
 
 type GammaMarket struct {
-	Slug                  string  `json:"slug"`
-	ConditionID           string  `json:"conditionId"`
-	GroupItemTitle        string  `json:"groupItemTitle"`
-	GroupItemThreshold    int     `json:"groupItemThreshold"`
-	ClobTokenIDs          string  `json:"clobTokenIds"`
-	OutcomePrices         string  `json:"outcomePrices"`
-	OrderPriceMinTickSize string  `json:"orderPriceMinTickSize"`
-	VolumeNum             float64 `json:"volumeNum"`
+	Slug                  string            `json:"slug"`
+	ConditionID           string            `json:"conditionId"`
+	GroupItemTitle        string            `json:"groupItemTitle"`
+	GroupItemThreshold    int               `json:"groupItemThreshold"`
+	ClobTokenIDs          string            `json:"clobTokenIds"`
+	OutcomePrices         string            `json:"outcomePrices"`
+	OrderPriceMinTickSize string            `json:"orderPriceMinTickSize"`
+	VolumeNum             float64           `json:"volumeNum"`
+	FeeSchedule           *GammaFeeSchedule `json:"feeSchedule,omitempty"`
 
 	Active          *bool `json:"active,omitempty"`
 	Closed          *bool `json:"closed,omitempty"`
@@ -103,14 +131,15 @@ type GammaMarket struct {
 
 func (m *GammaMarket) UnmarshalJSON(raw []byte) error {
 	var in struct {
-		Slug                  string     `json:"slug"`
-		ConditionID           string     `json:"conditionId"`
-		GroupItemTitle        string     `json:"groupItemTitle"`
-		GroupItemThreshold    flexInt    `json:"groupItemThreshold"`
-		ClobTokenIDs          string     `json:"clobTokenIds"`
-		OutcomePrices         string     `json:"outcomePrices"`
-		OrderPriceMinTickSize flexString `json:"orderPriceMinTickSize"`
-		VolumeNum             flexFloat  `json:"volumeNum"`
+		Slug                  string            `json:"slug"`
+		ConditionID           string            `json:"conditionId"`
+		GroupItemTitle        string            `json:"groupItemTitle"`
+		GroupItemThreshold    flexInt           `json:"groupItemThreshold"`
+		ClobTokenIDs          string            `json:"clobTokenIds"`
+		OutcomePrices         string            `json:"outcomePrices"`
+		OrderPriceMinTickSize flexString        `json:"orderPriceMinTickSize"`
+		VolumeNum             flexFloat         `json:"volumeNum"`
+		FeeSchedule           *GammaFeeSchedule `json:"feeSchedule,omitempty"`
 
 		Active          *bool `json:"active"`
 		Closed          *bool `json:"closed"`
@@ -129,6 +158,7 @@ func (m *GammaMarket) UnmarshalJSON(raw []byte) error {
 	m.OutcomePrices = in.OutcomePrices
 	m.OrderPriceMinTickSize = string(in.OrderPriceMinTickSize)
 	m.VolumeNum = float64(in.VolumeNum)
+	m.FeeSchedule = in.FeeSchedule
 	m.Active = in.Active
 	m.Closed = in.Closed
 	m.AcceptingOrders = in.AcceptingOrders

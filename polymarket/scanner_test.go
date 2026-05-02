@@ -13,6 +13,7 @@ func TestGammaMarketUnmarshalFlexibleFields(t *testing.T) {
 		"conditionId":"0xabc",
 		"groupItemTitle":"100,000",
 		"groupItemThreshold":"100000",
+		"feeSchedule":{"rate":"0.072","exponent":1,"takerOnly":true,"rebateRate":0.2},
 		"clobTokenIds":"[\"yes\",\"no\"]",
 		"outcomePrices":"[\"0.40\",\"0.60\"]",
 		"orderPriceMinTickSize":0.001,
@@ -40,6 +41,13 @@ func TestGammaMarketUnmarshalFlexibleFields(t *testing.T) {
 		got.EnableOrderBook == nil || !*got.EnableOrderBook {
 		t.Fatalf("GammaMarket bool fields decoded incorrectly: %+v", got)
 	}
+	if got.FeeSchedule == nil ||
+		got.FeeSchedule.Rate != "0.072" ||
+		got.FeeSchedule.Exponent != "1" ||
+		!got.FeeSchedule.TakerOnly ||
+		got.FeeSchedule.RebateRate != "0.2" {
+		t.Fatalf("GammaMarket fee schedule decoded incorrectly: %+v", got.FeeSchedule)
+	}
 }
 
 func TestGammaEventUnmarshalFlexibleFee(t *testing.T) {
@@ -60,6 +68,8 @@ func TestGammaEventUnmarshalFlexibleFee(t *testing.T) {
 		got.Volume24hr != 42.5 ||
 		got.FeeSchedule == nil ||
 		got.FeeSchedule.FeeRate != 0.072 ||
+		got.FeeSchedule.Rate != "0.072" ||
+		got.FeeSchedule.Exponent != "1" ||
 		len(got.Markets) != 1 {
 		t.Fatalf("GammaEvent decoded incorrectly: %+v", got)
 	}
