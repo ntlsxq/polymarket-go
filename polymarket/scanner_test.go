@@ -3,51 +3,87 @@ package polymarket
 import (
 	"reflect"
 	"testing"
-	"time"
+
+	"github.com/goccy/go-json"
 )
 
-func TestUpcomingDateStringsIncludesTodayThroughWeekAhead(t *testing.T) {
-	now := time.Date(2026, time.April, 29, 12, 0, 0, 0, et)
+func TestGammaMarketUnmarshalFlexibleFields(t *testing.T) {
+	raw := []byte(`{
+		"slug":"bitcoin-above-100k-on-may-3",
+		"conditionId":"0xabc",
+		"groupItemTitle":"100,000",
+		"groupItemThreshold":"100000",
+		"clobTokenIds":"[\"yes\",\"no\"]",
+		"outcomePrices":"[\"0.40\",\"0.60\"]",
+		"orderPriceMinTickSize":0.001,
+		"volumeNum":"12.5",
+		"active":true,
+		"closed":false,
+		"acceptingOrders":true,
+		"enableOrderBook":true
+	}`)
 
-	got := upcomingDateStrings(now, defaultScanDaysAhead)
-	want := []string{
-		"april-29",
-		"april-30",
-		"may-1",
-		"may-2",
-		"may-3",
-		"may-4",
-		"may-5",
-		"may-6",
+	var got GammaMarket
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
 	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("upcomingDateStrings()=%v want %v", got, want)
+	if got.Slug != "bitcoin-above-100k-on-may-3" ||
+		got.ConditionID != "0xabc" ||
+		got.GroupItemThreshold != 100000 ||
+		got.OrderPriceMinTickSize != "0.001" ||
+		got.VolumeNum != 12.5 {
+		t.Fatalf("GammaMarket decoded incorrectly: %+v", got)
+	}
+	if got.Active == nil || !*got.Active ||
+		got.Closed == nil || *got.Closed ||
+		got.AcceptingOrders == nil || !*got.AcceptingOrders ||
+		got.EnableOrderBook == nil || !*got.EnableOrderBook {
+		t.Fatalf("GammaMarket bool fields decoded incorrectly: %+v", got)
 	}
 }
 
-func TestScanEventSlugsUsesKnownDailyEventPatterns(t *testing.T) {
-	got := scanEventSlugs([]string{"bitcoin", "ethereum"}, []string{"april-29"})
-	want := []string{
-		"bitcoin-above-on-april-29",
-		"bitcoin-price-on-april-29",
-		"ethereum-above-on-april-29",
-		"ethereum-price-on-april-29",
-	}
+func TestGammaEventUnmarshalFlexibleFee(t *testing.T) {
+	raw := []byte(`{
+		"slug":"bitcoin-above-on-may-3",
+		"negRiskMarketID":"0xmarket",
+		"volume24hr":"42.5",
+		"feeSchedule":{"feeRate":"0.072"},
+		"markets":[{"conditionId":"0xabc"}]
+	}`)
 
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("scanEventSlugs()=%v want %v", got, want)
+	var got GammaEvent
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Slug != "bitcoin-above-on-may-3" ||
+		got.NegRiskMarketID != "0xmarket" ||
+		got.Volume24hr != 42.5 ||
+		got.FeeSchedule == nil ||
+		got.FeeSchedule.FeeRate != 0.072 ||
+		len(got.Markets) != 1 {
+		t.Fatalf("GammaEvent decoded incorrectly: %+v", got)
 	}
 }
 
-func TestScanEventSlugsDeduplicatesInputs(t *testing.T) {
-	got := scanEventSlugs([]string{"bitcoin", "bitcoin"}, []string{"april-29", "april-29"})
-	want := []string{
-		"bitcoin-above-on-april-29",
-		"bitcoin-price-on-april-29",
+func TestGammaMarketTokenAndPriceLists(t *testing.T) {
+	m := GammaMarket{
+		ClobTokenIDs:  `["yes","no"]`,
+		OutcomePrices: `["0.40","0.60"]`,
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("scanEventSlugs()=%v want %v", got, want)
+	tokens, err := m.ClobTokenIDList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"yes", "no"}; !reflect.DeepEqual(tokens, want) {
+		t.Fatalf("ClobTokenIDList() = %v, want %v", tokens, want)
+	}
+
+	prices, err := m.OutcomePriceList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"0.40", "0.60"}; !reflect.DeepEqual(prices, want) {
+		t.Fatalf("OutcomePriceList() = %v, want %v", prices, want)
 	}
 }
