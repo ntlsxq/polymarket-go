@@ -51,6 +51,31 @@ func TestDispatchSingleObjectFallback(t *testing.T) {
 	}
 }
 
+func TestDispatchBookLevelsKeepDecimalStrings(t *testing.T) {
+	ws := newTestWS(t)
+	var got []MarketWSEvent
+	ws.SetOnMarketEvent(func(ev MarketWSEvent) {
+		got = append(got, ev)
+	})
+
+	ws.dispatch([]byte(`{
+		"event_type":"book",
+		"asset_id":"` + yesTID + `",
+		"bids":[{"price":"0.50","size":"5.00"}],
+		"asks":[{"price":0.55,"size":3}]
+	}`))
+
+	if len(got) != 1 || got[0].Book == nil {
+		t.Fatalf("book dispatch = %+v", got)
+	}
+	if got[0].Book.Bids[0].Price != "0.50" || got[0].Book.Bids[0].Size != "5.00" {
+		t.Fatalf("quoted level changed: %+v", got[0].Book.Bids[0])
+	}
+	if got[0].Book.Asks[0].Price != "0.55" || got[0].Book.Asks[0].Size != "3" {
+		t.Fatalf("numeric level not normalized as strings: %+v", got[0].Book.Asks[0])
+	}
+}
+
 func TestDispatchPublishesTypedMarketEventsForAllEventTypes(t *testing.T) {
 	ws := newTestWS(t)
 
@@ -132,7 +157,7 @@ func TestDispatchPublishesTypedMarketEventsForAllEventTypes(t *testing.T) {
 			t.Fatalf("event[%d] raw payload is empty", i)
 		}
 	}
-	if got[0].Book == nil || got[0].Book.AssetID != yesTID || len(got[0].Book.Bids) != 1 || got[0].Book.Bids[0].Price != 0.50 {
+	if got[0].Book == nil || got[0].Book.AssetID != yesTID || len(got[0].Book.Bids) != 1 || got[0].Book.Bids[0].Price != "0.50" {
 		t.Fatalf("book typed payload not populated: %+v", got[0].Book)
 	}
 	if got[1].PriceChange == nil || len(got[1].PriceChange.Changes) != 1 || got[1].PriceChange.Changes[0].Price != "0.49" {

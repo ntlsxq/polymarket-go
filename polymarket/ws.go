@@ -21,12 +21,12 @@ type marketSubscribe struct {
 	CustomFeatureEnabled bool     `json:"custom_feature_enabled,omitempty"`
 }
 
-// Inbound market-WS event shapes. flexFloat lets price/size arrive as either
-// string or number — Polymarket is inconsistent across event types.
+// Inbound market-WS event shapes. flexString preserves price/size as decimal
+// strings even when Polymarket sends JSON numbers.
 
 type wsBookLevel struct {
-	Price flexFloat `json:"price"`
-	Size  flexFloat `json:"size"`
+	Price flexString `json:"price"`
+	Size  flexString `json:"size"`
 }
 
 type wsPriceChangeEntry struct {
@@ -55,8 +55,8 @@ type MarketWSBookEvent struct {
 }
 
 type MarketWSBookLevel struct {
-	Price float64
-	Size  float64
+	Price string
+	Size  string
 }
 
 type MarketWSPriceChange struct {
@@ -463,8 +463,10 @@ func firstNonEmptySlice(values ...[]string) []string {
 func toBookLevels(in []wsBookLevel) []MarketWSBookLevel {
 	out := make([]MarketWSBookLevel, 0, len(in))
 	for _, e := range in {
-		if e.Price > 0 {
-			out = append(out, MarketWSBookLevel{Price: float64(e.Price), Size: float64(e.Size)})
+		price := string(e.Price)
+		size := string(e.Size)
+		if price != "" && size != "" {
+			out = append(out, MarketWSBookLevel{Price: price, Size: size})
 		}
 	}
 	return out
